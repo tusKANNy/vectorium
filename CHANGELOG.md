@@ -3,26 +3,25 @@
 Changes that matter to crates depending on vectorium (kANNolo, Seismic).
 Newest entries go at the top of each section.
 
-## [0.10.0] - unreleased (branch `compression`)
+## [0.11.0] - unreleased (branch `compression`)
 
 This branch (`compression`) started from `main` at `3fedb2f` (0.4.0) and has since merged
 `origin/main` up to its 0.10.0 (`5850880`). The tables below list what `compression` adds or changes;
 the 0.5.0–0.10.0 changes of `main` themselves (RaBitQ, `l1_prune_split`, the `Config`/`QueryParams`
 encoder API, generic dense/sparse k-means, `WithDistance`, `RerankIndex` moved to kANNolo, …) are in
-the git history of `origin/main`. Commit hashes
-below are on `compression`; "relative to `main`" means relative to 0.4.0 unless stated otherwise.
+the git history of `origin/main`. Commit hashes below are on `compression`; "relative to `main`" means relative to 0.4.0 unless stated otherwise.
 
-Dependents: change the vectorium dependency to `0.10.0` (or the new git `rev`).
+Dependents: change the vectorium dependency to `0.11.0` (or the new git `rev`).
 
-### Coming from 0.9.4
+### Coming from 0.10.0
 
-A crate already on 0.9.4 only needs the breaking changes below that come from `compression`
+A crate already on `main`'s 0.10.0 only needs the breaking changes below that come from `compression`
 (DotVByte removal; DotPacking8 `train` and `BlockedSparseEncoder` type annotations). Everything
-added on `compression` follows the 0.9.4 API: conversions take a config
+added on `compression` follows the 0.10.0 API: conversions take a config
 (`ScalarU8SparseDataset::<u16, DotProduct>::convert_from(plain, ())`, `plain.convert_into(())`),
 evaluators take query parameters (`encoder.query_evaluator(query, &())`), and every new encoder has
 `QueryParams = ()`. `compute_groundtruth --l1-prune` works with every sparse encoder (pruning happens
-before encoding). The `rgbisect` dependency of 0.9.4 is dropped together with DotVByte.
+before encoding). The `rgbisect` dependency of 0.10.0 is dropped together with DotVByte.
 
 ### What kANNolo and Seismic must support
 
