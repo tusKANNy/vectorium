@@ -154,8 +154,8 @@ where
         DenseMultiVectorView::new(&self.data.as_ref()[range], self.encoder.output_dim())
     }
 
-    fn prefetch_with_range(&self, range: std::ops::Range<usize>) {
-        prefetch_read_slice(&self.data.as_ref()[range]);
+    fn prefetch_with_range(&self, range: std::ops::Range<usize>, max_bytes: usize) {
+        prefetch_read_slice(&self.data.as_ref()[range], max_bytes);
     }
 
     fn iter(&self) -> impl Iterator<Item = E::EncodedVector<'_>> {

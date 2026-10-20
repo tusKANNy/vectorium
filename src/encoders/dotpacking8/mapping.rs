@@ -66,11 +66,17 @@ impl<C: PackedComponent> ComponentMapping<C> {
             inverse[mapped] = C::from_usize(original);
         }
         let forward: Vec<C> = permutation.iter().map(|&m| C::from_usize(m)).collect();
-        Self { forward: forward.into_boxed_slice(), inverse: inverse.into_boxed_slice() }
+        Self {
+            forward: forward.into_boxed_slice(),
+            inverse: inverse.into_boxed_slice(),
+        }
     }
 
     /// Orders components by decreasing document frequency over the components of every vector.
-    pub fn by_decreasing_frequency<'a>(dim: usize, components: impl Iterator<Item = &'a [C]>) -> Self
+    pub fn by_decreasing_frequency<'a>(
+        dim: usize,
+        components: impl Iterator<Item = &'a [C]>,
+    ) -> Self
     where
         C: 'a,
     {

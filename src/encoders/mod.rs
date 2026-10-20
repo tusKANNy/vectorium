@@ -1,13 +1,13 @@
 pub mod blocked_sparse;
 pub mod dense_scalar;
 pub mod dotpacking8;
-pub mod dotpacking8_u16_fixedu8;
-pub mod dotpacking8_u16_scalaru8;
-pub mod dotpacking8_u16_scalaru16;
 pub mod dotpacking8_u16_f16;
+pub mod dotpacking8_u16_fixedu8;
 pub mod dotpacking8_u16_scalar4bit;
-pub mod dotpacking8_u32_scalaru8;
+pub mod dotpacking8_u16_scalaru16;
+pub mod dotpacking8_u16_scalaru8;
 pub mod dotpacking8_u32_scalaru16;
+pub mod dotpacking8_u32_scalaru8;
 #[cfg(feature = "multivec")]
 pub mod multivec_pq;
 #[cfg(feature = "multivec")]

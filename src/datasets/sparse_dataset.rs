@@ -329,13 +329,13 @@ where
     }
 
     #[inline]
-    fn prefetch_with_range(&self, range: std::ops::Range<usize>) {
+    fn prefetch_with_range(&self, range: std::ops::Range<usize>, max_bytes: usize) {
         let components = self.storage.components().as_ref();
         let values = self.storage.values().as_ref();
         unsafe { assert_unchecked(components.len() == values.len()) };
 
-        prefetch_read_slice(&components[range.clone()]);
-        prefetch_read_slice(&values[range]);
+        prefetch_read_slice(&components[range.clone()], max_bytes);
+        prefetch_read_slice(&values[range], max_bytes);
     }
 
     fn encoder(&self) -> &E {
@@ -1332,7 +1332,7 @@ mod tests {
         let par_values: Vec<Vec<_>> = frozen.par_iter().map(|v| v.values().to_vec()).collect();
         assert_eq!(iter_values, par_values);
 
-        frozen.prefetch_with_range(second_range);
+        frozen.prefetch_with_range(second_range, 256);
     }
 
     #[test]

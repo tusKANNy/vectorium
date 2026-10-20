@@ -10,10 +10,7 @@ use std::simd::prelude::*;
 use crate::encoders::dotpacking8::common::f16_ptr_to_f32x8;
 use crate::encoders::dotpacking8::nibble4bit::{NibbleReader, nibble_bytes, pack_nibbles};
 use crate::utils::sparse_scalar_quantizer_steps;
-use crate::{
-    ComponentType, FixedU8Q, FromF32,
-    SpaceUsage, ValueType,
-};
+use crate::{ComponentType, FixedU8Q, FromF32, SpaceUsage, ValueType};
 
 const N: usize = 8;
 
@@ -68,7 +65,10 @@ impl<'a> U8Reader<'a> {
     #[inline(always)]
     fn check(&self, len: usize) {
         #[cfg(debug_assertions)]
-        assert!(self.ptr as usize + len <= self.end as usize, "value stream over-read");
+        assert!(
+            self.ptr as usize + len <= self.end as usize,
+            "value stream over-read"
+        );
         let _ = len;
     }
 }
@@ -131,7 +131,11 @@ impl<'a> F16Reader<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
         // An empty stream (empty vector) may not be 2-byte aligned; anything else is, by
         // invariant (1).
-        let values: &'a [f16] = if bytes.is_empty() { &[] } else { bytemuck::cast_slice(bytes) };
+        let values: &'a [f16] = if bytes.is_empty() {
+            &[]
+        } else {
+            bytemuck::cast_slice(bytes)
+        };
         Self {
             ptr: values.as_ptr(),
             #[cfg(debug_assertions)]
@@ -184,14 +188,14 @@ impl ValueReader for F16Reader<'_> {
 
     #[inline(always)]
     fn code_as_f32(code: f16) -> f32 {
-        code.to_f32()
+        crate::utils::numeric_markers::f16_to_f32(code)
     }
 
     #[inline(always)]
     fn tail_value(&self, i: usize) -> f32 {
         self.check(i + 1);
         // SAFETY: the tail has `n % 8` values left in the stream, invariant (4) in `common.rs`.
-        (unsafe { *self.ptr.add(i) }).to_f32()
+        crate::utils::numeric_markers::f16_to_f32(unsafe { *self.ptr.add(i) })
     }
 }
 
@@ -278,7 +282,14 @@ impl ValueReader for U16Reader<'_> {
 /// the encoder is generic over it.
 pub trait ValueCodec:
     crate::core::sealed::Sealed
-    + Clone + Debug + PartialEq + Send + Sync + SpaceUsage + Serialize + DeserializeOwned
+    + Clone
+    + Debug
+    + PartialEq
+    + Send
+    + Sync
+    + SpaceUsage
+    + Serialize
+    + DeserializeOwned
 {
     type Code: Copy + PartialEq + Debug + Send + Sync + 'static;
     /// `SparseDataEncoder::OutputValueType` of encoders using this codec.
@@ -288,7 +299,11 @@ pub trait ValueCodec:
     /// Fits per-component parameters on `(components, values)` pairs of vectors with
     /// components in `0..dim`; no-op by default.
     fn train<'a, C, W>(&mut self, _dim: usize, _vectors: impl Iterator<Item = (&'a [C], &'a [W])>)
-    where C: ComponentType, W: ValueType {}
+    where
+        C: ComponentType,
+        W: ValueType,
+    {
+    }
     fn encode(&self, component: usize, value: f32) -> Self::Code;
     fn decode(&self, component: usize, code: Self::Code) -> f32;
     /// Query value as stored in the dense query (scaled so `query * code_as_f32(code)` is the
@@ -307,7 +322,9 @@ pub trait ValueCodec:
 pub struct FixedU8Values;
 
 impl SpaceUsage for FixedU8Values {
-    fn space_usage_bytes(&self) -> usize { 0 }
+    fn space_usage_bytes(&self) -> usize {
+        0
+    }
 }
 
 const FIXED_U8_SCALE: f32 = 1.0 / ((1u32 << FixedU8Q::FRAC_NBITS) as f32);
@@ -318,17 +335,33 @@ impl ValueCodec for FixedU8Values {
     type Code = u8;
     type Output = u8;
     type Reader<'a> = U8Reader<'a>;
-    fn new_untrained(_dim: usize) -> Self { FixedU8Values }
+    fn new_untrained(_dim: usize) -> Self {
+        FixedU8Values
+    }
     #[inline(always)]
-    fn encode(&self, _c: usize, v: f32) -> u8 { FixedU8Q::from_f32_saturating(v).to_bits() }
+    fn encode(&self, _c: usize, v: f32) -> u8 {
+        FixedU8Q::from_f32_saturating(v).to_bits()
+    }
     #[inline(always)]
-    fn decode(&self, _c: usize, code: u8) -> f32 { FixedU8Q::from_bits(code).to_f32().unwrap() }
+    fn decode(&self, _c: usize, code: u8) -> f32 {
+        FixedU8Q::from_bits(code).to_f32().unwrap()
+    }
     #[inline(always)]
-    fn query_value(&self, _c: usize, v: f32) -> f32 { v * FIXED_U8_SCALE }
-    fn zero_code() -> u8 { 0 }
-    fn stream_bytes(n: usize) -> usize { n }
-    fn write_stream(out: &mut Vec<u8>, codes: &[u8]) { out.extend_from_slice(codes) }
-    fn reader(stream: &[u8]) -> U8Reader<'_> { U8Reader::new(stream) }
+    fn query_value(&self, _c: usize, v: f32) -> f32 {
+        v * FIXED_U8_SCALE
+    }
+    fn zero_code() -> u8 {
+        0
+    }
+    fn stream_bytes(n: usize) -> usize {
+        n
+    }
+    fn write_stream(out: &mut Vec<u8>, codes: &[u8]) {
+        out.extend_from_slice(codes)
+    }
+    fn reader(stream: &[u8]) -> U8Reader<'_> {
+        U8Reader::new(stream)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -337,12 +370,18 @@ pub struct ScalarU8Values {
 }
 
 impl ScalarU8Values {
-    pub fn from_steps(quants: Box<[f32]>) -> Self { Self { quants } }
-    pub fn steps(&self) -> &[f32] { &self.quants }
+    pub fn from_steps(quants: Box<[f32]>) -> Self {
+        Self { quants }
+    }
+    pub fn steps(&self) -> &[f32] {
+        &self.quants
+    }
 }
 
 impl SpaceUsage for ScalarU8Values {
-    fn space_usage_bytes(&self) -> usize { self.quants.len() * std::mem::size_of::<f32>() }
+    fn space_usage_bytes(&self) -> usize {
+        self.quants.len() * std::mem::size_of::<f32>()
+    }
 }
 
 impl crate::core::sealed::Sealed for ScalarU8Values {}
@@ -351,24 +390,46 @@ impl ValueCodec for ScalarU8Values {
     type Code = u8;
     type Output = u8;
     type Reader<'a> = U8Reader<'a>;
-    fn new_untrained(dim: usize) -> Self { Self::from_steps(vec![0.0; dim].into_boxed_slice()) }
+    fn new_untrained(dim: usize) -> Self {
+        Self::from_steps(vec![0.0; dim].into_boxed_slice())
+    }
     fn train<'a, C, W>(&mut self, dim: usize, vectors: impl Iterator<Item = (&'a [C], &'a [W])>)
-    where C: ComponentType, W: ValueType {
-        self.quants = sparse_scalar_quantizer_steps(dim, vectors, 0.0, 1.0, 255.0).into_boxed_slice();
+    where
+        C: ComponentType,
+        W: ValueType,
+    {
+        self.quants =
+            sparse_scalar_quantizer_steps(dim, vectors, 0.0, 1.0, 255.0).into_boxed_slice();
     }
     #[inline(always)]
     fn encode(&self, c: usize, v: f32) -> u8 {
         let q = self.quants[c];
-        if q > 0.0 { (v / q).clamp(0.0, 255.0) as u8 } else { 0 }
+        if q > 0.0 {
+            (v / q).clamp(0.0, 255.0) as u8
+        } else {
+            0
+        }
     }
     #[inline(always)]
-    fn decode(&self, c: usize, code: u8) -> f32 { code as f32 * self.quants[c] }
+    fn decode(&self, c: usize, code: u8) -> f32 {
+        code as f32 * self.quants[c]
+    }
     #[inline(always)]
-    fn query_value(&self, c: usize, v: f32) -> f32 { v * self.quants[c] }
-    fn zero_code() -> u8 { 0 }
-    fn stream_bytes(n: usize) -> usize { n }
-    fn write_stream(out: &mut Vec<u8>, codes: &[u8]) { out.extend_from_slice(codes) }
-    fn reader(stream: &[u8]) -> U8Reader<'_> { U8Reader::new(stream) }
+    fn query_value(&self, c: usize, v: f32) -> f32 {
+        v * self.quants[c]
+    }
+    fn zero_code() -> u8 {
+        0
+    }
+    fn stream_bytes(n: usize) -> usize {
+        n
+    }
+    fn write_stream(out: &mut Vec<u8>, codes: &[u8]) {
+        out.extend_from_slice(codes)
+    }
+    fn reader(stream: &[u8]) -> U8Reader<'_> {
+        U8Reader::new(stream)
+    }
 }
 
 /// 16-bit scalar codes with one step per component (`max / 65535`), rounded to the nearest
@@ -379,12 +440,18 @@ pub struct ScalarU16Values {
 }
 
 impl ScalarU16Values {
-    pub fn from_steps(quants: Box<[f32]>) -> Self { Self { quants } }
-    pub fn steps(&self) -> &[f32] { &self.quants }
+    pub fn from_steps(quants: Box<[f32]>) -> Self {
+        Self { quants }
+    }
+    pub fn steps(&self) -> &[f32] {
+        &self.quants
+    }
 }
 
 impl SpaceUsage for ScalarU16Values {
-    fn space_usage_bytes(&self) -> usize { self.quants.len() * std::mem::size_of::<f32>() }
+    fn space_usage_bytes(&self) -> usize {
+        self.quants.len() * std::mem::size_of::<f32>()
+    }
 }
 
 impl crate::core::sealed::Sealed for ScalarU16Values {}
@@ -393,31 +460,55 @@ impl ValueCodec for ScalarU16Values {
     type Code = u16;
     type Output = u16;
     type Reader<'a> = U16Reader<'a>;
-    fn new_untrained(dim: usize) -> Self { Self::from_steps(vec![0.0; dim].into_boxed_slice()) }
+    fn new_untrained(dim: usize) -> Self {
+        Self::from_steps(vec![0.0; dim].into_boxed_slice())
+    }
     fn train<'a, C, W>(&mut self, dim: usize, vectors: impl Iterator<Item = (&'a [C], &'a [W])>)
-    where C: ComponentType, W: ValueType {
-        self.quants = sparse_scalar_quantizer_steps(dim, vectors, 0.0, 1.0, 65535.0).into_boxed_slice();
+    where
+        C: ComponentType,
+        W: ValueType,
+    {
+        self.quants =
+            sparse_scalar_quantizer_steps(dim, vectors, 0.0, 1.0, 65535.0).into_boxed_slice();
     }
     #[inline(always)]
     fn encode(&self, c: usize, v: f32) -> u16 {
         let q = self.quants[c];
-        if q > 0.0 { (v / q).round().clamp(0.0, 65535.0) as u16 } else { 0 }
+        if q > 0.0 {
+            (v / q).round().clamp(0.0, 65535.0) as u16
+        } else {
+            0
+        }
     }
     #[inline(always)]
-    fn decode(&self, c: usize, code: u16) -> f32 { code as f32 * self.quants[c] }
+    fn decode(&self, c: usize, code: u16) -> f32 {
+        code as f32 * self.quants[c]
+    }
     #[inline(always)]
-    fn query_value(&self, c: usize, v: f32) -> f32 { v * self.quants[c] }
-    fn zero_code() -> u16 { 0 }
-    fn stream_bytes(n: usize) -> usize { 2 * n }
-    fn write_stream(out: &mut Vec<u8>, codes: &[u16]) { out.extend_from_slice(bytemuck::cast_slice(codes)) }
-    fn reader(stream: &[u8]) -> U16Reader<'_> { U16Reader::new(stream) }
+    fn query_value(&self, c: usize, v: f32) -> f32 {
+        v * self.quants[c]
+    }
+    fn zero_code() -> u16 {
+        0
+    }
+    fn stream_bytes(n: usize) -> usize {
+        2 * n
+    }
+    fn write_stream(out: &mut Vec<u8>, codes: &[u16]) {
+        out.extend_from_slice(bytemuck::cast_slice(codes))
+    }
+    fn reader(stream: &[u8]) -> U16Reader<'_> {
+        U16Reader::new(stream)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct F16Values;
 
 impl SpaceUsage for F16Values {
-    fn space_usage_bytes(&self) -> usize { 0 }
+    fn space_usage_bytes(&self) -> usize {
+        0
+    }
 }
 
 impl crate::core::sealed::Sealed for F16Values {}
@@ -426,17 +517,33 @@ impl ValueCodec for F16Values {
     type Code = f16;
     type Output = f16;
     type Reader<'a> = F16Reader<'a>;
-    fn new_untrained(_dim: usize) -> Self { F16Values }
+    fn new_untrained(_dim: usize) -> Self {
+        F16Values
+    }
     #[inline(always)]
-    fn encode(&self, _c: usize, v: f32) -> f16 { f16::from_f32(v) }
+    fn encode(&self, _c: usize, v: f32) -> f16 {
+        f16::from_f32(v)
+    }
     #[inline(always)]
-    fn decode(&self, _c: usize, code: f16) -> f32 { code.to_f32() }
+    fn decode(&self, _c: usize, code: f16) -> f32 {
+        code.to_f32()
+    }
     #[inline(always)]
-    fn query_value(&self, _c: usize, v: f32) -> f32 { v }
-    fn zero_code() -> f16 { f16::ZERO }
-    fn stream_bytes(n: usize) -> usize { 2 * n }
-    fn write_stream(out: &mut Vec<u8>, codes: &[f16]) { out.extend_from_slice(bytemuck::cast_slice(codes)) }
-    fn reader(stream: &[u8]) -> F16Reader<'_> { F16Reader::new(stream) }
+    fn query_value(&self, _c: usize, v: f32) -> f32 {
+        v
+    }
+    fn zero_code() -> f16 {
+        f16::ZERO
+    }
+    fn stream_bytes(n: usize) -> usize {
+        2 * n
+    }
+    fn write_stream(out: &mut Vec<u8>, codes: &[f16]) {
+        out.extend_from_slice(bytemuck::cast_slice(codes))
+    }
+    fn reader(stream: &[u8]) -> F16Reader<'_> {
+        F16Reader::new(stream)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -448,11 +555,15 @@ pub struct Scalar4BitValues {
 const NUM_LEVELS: f32 = 15.0;
 
 impl Scalar4BitValues {
-    pub fn from_steps(quants: Box<[f32]>) -> Self { Self { quants } }
+    pub fn from_steps(quants: Box<[f32]>) -> Self {
+        Self { quants }
+    }
 }
 
 impl SpaceUsage for Scalar4BitValues {
-    fn space_usage_bytes(&self) -> usize { self.quants.len() * std::mem::size_of::<f32>() }
+    fn space_usage_bytes(&self) -> usize {
+        self.quants.len() * std::mem::size_of::<f32>()
+    }
 }
 
 impl crate::core::sealed::Sealed for Scalar4BitValues {}
@@ -461,25 +572,46 @@ impl ValueCodec for Scalar4BitValues {
     type Code = u8;
     type Output = u8;
     type Reader<'a> = NibbleReader<'a>;
-    fn new_untrained(dim: usize) -> Self { Self::from_steps(vec![0.0; dim].into_boxed_slice()) }
+    fn new_untrained(dim: usize) -> Self {
+        Self::from_steps(vec![0.0; dim].into_boxed_slice())
+    }
     fn train<'a, C, W>(&mut self, dim: usize, vectors: impl Iterator<Item = (&'a [C], &'a [W])>)
-    where C: ComponentType, W: ValueType {
+    where
+        C: ComponentType,
+        W: ValueType,
+    {
         self.quants =
             sparse_scalar_quantizer_steps(dim, vectors, 0.0, 1.0, NUM_LEVELS).into_boxed_slice();
     }
     #[inline(always)]
     fn encode(&self, c: usize, v: f32) -> u8 {
         let q = self.quants[c];
-        if q > 0.0 { (v / q).clamp(0.0, NUM_LEVELS) as u8 } else { 0 }
+        if q > 0.0 {
+            (v / q).clamp(0.0, NUM_LEVELS) as u8
+        } else {
+            0
+        }
     }
     #[inline(always)]
-    fn decode(&self, c: usize, code: u8) -> f32 { code as f32 * self.quants[c] }
+    fn decode(&self, c: usize, code: u8) -> f32 {
+        code as f32 * self.quants[c]
+    }
     #[inline(always)]
-    fn query_value(&self, c: usize, v: f32) -> f32 { v * self.quants[c] }
-    fn zero_code() -> u8 { 0 }
-    fn stream_bytes(n: usize) -> usize { nibble_bytes(n) }
-    fn write_stream(out: &mut Vec<u8>, codes: &[u8]) { pack_nibbles(out, codes) }
-    fn reader(stream: &[u8]) -> NibbleReader<'_> { NibbleReader::new(stream) }
+    fn query_value(&self, c: usize, v: f32) -> f32 {
+        v * self.quants[c]
+    }
+    fn zero_code() -> u8 {
+        0
+    }
+    fn stream_bytes(n: usize) -> usize {
+        nibble_bytes(n)
+    }
+    fn write_stream(out: &mut Vec<u8>, codes: &[u8]) {
+        pack_nibbles(out, codes)
+    }
+    fn reader(stream: &[u8]) -> NibbleReader<'_> {
+        NibbleReader::new(stream)
+    }
 }
 
 #[cfg(test)]
@@ -510,7 +642,11 @@ mod tests {
     }
 
     fn roundtrip<V: ValueCodec>(codec: &V, values: &[f32]) -> Vec<f32> {
-        let codes: Vec<V::Code> = values.iter().enumerate().map(|(c, &v)| codec.encode(c, v)).collect();
+        let codes: Vec<V::Code> = values
+            .iter()
+            .enumerate()
+            .map(|(c, &v)| codec.encode(c, v))
+            .collect();
         let mut stream = Vec::new();
         V::write_stream(&mut stream, &codes);
         assert_eq!(stream.len(), V::stream_bytes(codes.len()));
@@ -520,7 +656,10 @@ mod tests {
             out.extend(r.next_block_codes());
         }
         out.extend(&r.tail(codes.len() % 8)[..codes.len() % 8]);
-        out.iter().enumerate().map(|(c, &code)| codec.decode(c, code)).collect()
+        out.iter()
+            .enumerate()
+            .map(|(c, &code)| codec.decode(c, code))
+            .collect()
     }
 
     #[test]
@@ -530,9 +669,15 @@ mod tests {
         let steps4: Box<[f32]> = vec![4.0 / 15.0; 19].into_boxed_slice();
         let cases: [(Vec<f32>, f32); 4] = [
             (roundtrip(&FixedU8Values, &values), 1.0 / 64.0),
-            (roundtrip(&ScalarU8Values::from_steps(steps), &values), 4.0 / 255.0),
+            (
+                roundtrip(&ScalarU8Values::from_steps(steps), &values),
+                4.0 / 255.0,
+            ),
             (roundtrip(&F16Values, &values), 0.002),
-            (roundtrip(&Scalar4BitValues::from_steps(steps4), &values), 4.0 / 15.0),
+            (
+                roundtrip(&Scalar4BitValues::from_steps(steps4), &values),
+                4.0 / 15.0,
+            ),
         ];
         for (decoded, tol) in cases {
             for (d, v) in decoded.iter().zip(&values) {
@@ -545,6 +690,9 @@ mod tests {
     fn query_value_times_code_equals_decoded_product() {
         let s = ScalarU8Values::from_steps(vec![0.5; 3].into_boxed_slice());
         let code = s.encode(1, 2.0);
-        assert_eq!(s.query_value(1, 3.0) * U8Reader::code_as_f32(code), 3.0 * s.decode(1, code));
+        assert_eq!(
+            s.query_value(1, 3.0) * U8Reader::code_as_f32(code),
+            3.0 * s.decode(1, code)
+        );
     }
 }

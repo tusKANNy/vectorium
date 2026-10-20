@@ -53,7 +53,11 @@ pub(crate) fn pack_nibbles(out: &mut Vec<u8>, codes: &[u8]) {
     let mut i = 0;
     while i < rem {
         let lo = codes[base + i] & 0x0F;
-        let hi = if i + 1 < rem { codes[base + i + 1] & 0x0F } else { 0 };
+        let hi = if i + 1 < rem {
+            codes[base + i + 1] & 0x0F
+        } else {
+            0
+        };
         out.push(lo | (hi << 4));
         i += 2;
     }

@@ -20,17 +20,18 @@ use crate::encoders::dotpacking8::values::ScalarU8Values;
 /// strictly positive values whose components all occur in the training data (checked on
 /// SPLARE: no entry quantizes to 0); it is checked by a `debug_assert!` in `push_encoded`.
 pub type BridgedDotPacking8U32ScalarU8Encoder = DotPacking8Encoder<u32, ScalarU8Values>;
-pub type BridgedDotPacking8U32ScalarU8QueryEvaluator<'e> = DotPacking8QueryEvaluator<'e, u32, ScalarU8Values>;
+pub type BridgedDotPacking8U32ScalarU8QueryEvaluator<'e> =
+    DotPacking8QueryEvaluator<'e, u32, ScalarU8Values>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SquaredEuclideanDistance;
-    use crate::vector_encoder::SparseDataEncoder;
-    use crate::{PackedSparseVectorEncoder, PlainSparseDataset, QueryEvaluator, VectorEncoder};
     use crate::PlainSparseDatasetGrowable;
+    use crate::SquaredEuclideanDistance;
     use crate::core::dataset::DatasetGrowable;
     use crate::core::vector::{PackedVectorView, SparseVectorView};
+    use crate::vector_encoder::SparseDataEncoder;
+    use crate::{PackedSparseVectorEncoder, PlainSparseDataset, QueryEvaluator, VectorEncoder};
 
     fn build_training_data(
         dim: usize,
@@ -123,7 +124,11 @@ mod tests {
         let td = build_training_data(4, &[(&[0_u32, 1, 2, 3], &[255.0_f32, 255.0, 255.0, 255.0])]);
         encoder.train(&td);
         assert!(
-            encoder.values().steps().iter().all(|&q| (q - 1.0).abs() < 1e-6),
+            encoder
+                .values()
+                .steps()
+                .iter()
+                .all(|&q| (q - 1.0).abs() < 1e-6),
             "expected quants == 1.0 for all components"
         );
 
@@ -210,7 +215,11 @@ mod tests {
         let query_values = [1.0_f32, 2.0, 3.0, 4.0];
         let evaluator = encoder.query_evaluator(SparseVectorView::new(&comps, &query_values), &());
         let dist = evaluator.compute_distance(PackedVectorView::new(&buffer));
-        assert!((dist.0 - 300.0).abs() < 1e-3, "expected 300, got {}", dist.0);
+        assert!(
+            (dist.0 - 300.0).abs() < 1e-3,
+            "expected 300, got {}",
+            dist.0
+        );
     }
 
     /// Bridges are an encoding artifact: decoding returns only the input components, also

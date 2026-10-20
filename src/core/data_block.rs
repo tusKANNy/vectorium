@@ -225,7 +225,7 @@ impl FromBlockF32 for u8 {
 
 block_type!(
     /// A cache-line-aligned block of 16 `(u16 component, f16 value)` pairs (64 bytes).
-    DataBlock, f16, 64, BlockValueKind::F16, |v: f16| v.to_f32()
+    DataBlock, f16, 64, BlockValueKind::F16, crate::utils::numeric_markers::f16_to_f32
 );
 block_type!(
     /// A cache-line-aligned block of 16 `(u16 component, u16 code)` pairs (64 bytes).
@@ -258,7 +258,10 @@ pub(crate) unsafe fn load_block<B: Block>(block: &B) -> (__m256i, __m256i) {
         match B::KIND {
             BlockValueKind::F16 | BlockValueKind::U16 => {
                 debug_assert!(std::mem::align_of::<B>() >= 32);
-                (_mm256_load_si256(comps_ptr), _mm256_load_si256(vals_ptr as *const __m256i))
+                (
+                    _mm256_load_si256(comps_ptr),
+                    _mm256_load_si256(vals_ptr as *const __m256i),
+                )
             }
             BlockValueKind::U8 => (
                 _mm256_loadu_si256(comps_ptr),
@@ -266,6 +269,35 @@ pub(crate) unsafe fn load_block<B: Block>(block: &B) -> (__m256i, __m256i) {
             ),
         }
     }
+}
+
+/// Portable [`load_block`]: the 16 components and the 16 values as 16-bit lanes (`f16` bits,
+/// `u16` codes, or `u8` codes zero-extended). Lowers to plain NEON loads (+ `uxtl` for `u8`).
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+pub(crate) fn load_block_portable<B: Block>(
+    block: &B,
+) -> (
+    std::simd::Simd<u16, BLOCK_SIZE>,
+    std::simd::Simd<u16, BLOCK_SIZE>,
+) {
+    use std::simd::{Simd, num::SimdUint};
+    let comps = Simd::from_array(*block.components());
+    let vals_ptr = block.values().as_ptr() as *const u8;
+    // SAFETY: `values()` holds 16 entries of `B::Value`, which `KIND` says is 2 bytes (`F16`,
+    // `U16`) or 1 byte (`U8`) wide.
+    let vals = unsafe {
+        match B::KIND {
+            BlockValueKind::F16 | BlockValueKind::U16 => {
+                vals_ptr.cast::<Simd<u16, BLOCK_SIZE>>().read_unaligned()
+            }
+            BlockValueKind::U8 => vals_ptr
+                .cast::<Simd<u8, BLOCK_SIZE>>()
+                .read_unaligned()
+                .cast(),
+        }
+    };
+    (comps, vals)
 }
 
 /// Compares 16 components against one query component, masks the 16-bit value lanes,
@@ -304,7 +336,9 @@ pub(crate) unsafe fn match_and_fma_16(
     // Widen 8 lanes to 8×f32 and FMA accumulate
     let f: __m256 = match kind {
         BlockValueKind::F16 => _mm256_cvtph_ps(merged),
-        BlockValueKind::U16 | BlockValueKind::U8 => _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(merged)),
+        BlockValueKind::U16 | BlockValueKind::U8 => {
+            _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(merged))
+        }
     };
     let scale: __m256 = _mm256_set1_ps(query_value);
     *acc = _mm256_fmadd_ps(f, scale, *acc);

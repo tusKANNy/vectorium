@@ -23,7 +23,12 @@ impl<'a> EncodedView<'a> {
     pub(crate) unsafe fn new<V: ValueCodec>(slice: &'a [u64]) -> Self {
         let bytes = cast_slice::<u64, u8>(slice);
         if bytes.is_empty() {
-            return Self { n: 0, selectors: &[], payload: &[], values: &[] };
+            return Self {
+                n: 0,
+                selectors: &[],
+                payload: &[],
+                values: &[],
+            };
         }
         let n = from_bytes::<u16>(&bytes[0..2]).to_le() as usize;
         let selectors_end = 2 + n.div_ceil(N).div_ceil(2);
@@ -49,18 +54,25 @@ pub(crate) fn write_encoded<V: ValueCodec>(
     if n == 0 {
         return;
     }
-    assert!(n <= u16::MAX as usize, "DotPacking8 vectors hold at most 65535 entries (bridges included), got {n}");
+    assert!(
+        n <= u16::MAX as usize,
+        "DotPacking8 vectors hold at most 65535 entries (bridges included), got {n}"
+    );
     let mut gaps = Vec::with_capacity(n);
     let mut last = 0u32;
     for &c in components {
         let g = c - last;
-        assert!(g <= u16::MAX as u32, "gap {g} exceeds u16::MAX; bridge insertion failed");
+        assert!(
+            g <= u16::MAX as u32,
+            "gap {g} exceeds u16::MAX; bridge insertion failed"
+        );
         gaps.push(g);
         last = c;
     }
     let (selectors, gap_payload) = encode_blocks(&gaps);
     let value_bytes = V::stream_bytes(n);
-    let mut payload = Vec::with_capacity(2 + selectors.len() + gap_payload.len() + 16 + value_bytes);
+    let mut payload =
+        Vec::with_capacity(2 + selectors.len() + gap_payload.len() + 16 + value_bytes);
     payload.extend_from_slice(&(n as u16).to_le_bytes());
     payload.extend_from_slice(&selectors);
     payload.extend_from_slice(&gap_payload);
@@ -76,15 +88,24 @@ pub(crate) fn write_encoded<V: ValueCodec>(
         "value stream wrote {} bytes, stream_bytes says {value_bytes}",
         payload.len() - before
     );
-    assert!(payload.len().is_multiple_of(8), "encoded vector is not a whole number of u64 words");
-    output.extend(payload.as_chunks::<8>().0.iter().map(|&chunk| u64::from_le_bytes(chunk)));
+    assert!(
+        payload.len().is_multiple_of(8),
+        "encoded vector is not a whole number of u64 words"
+    );
+    output.extend(
+        payload
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&chunk| u64::from_le_bytes(chunk)),
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoders::dotpacking8::values::{FixedU8Values, U8Reader};
     use crate::SpaceUsage;
+    use crate::encoders::dotpacking8::values::{FixedU8Values, U8Reader};
 
     /// A broken codec whose stream is shorter than it claims: the decoder's unchecked reads
     /// rely on `stream_bytes`, so `write_encoded` must refuse it.
@@ -131,4 +152,3 @@ mod tests {
         write_encoded::<ShortStream>(&[1, 2, 3], &[1, 1, 1], &mut out);
     }
 }
-

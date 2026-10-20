@@ -4,9 +4,17 @@
 const MAX_GAP: u32 = u16::MAX as u32;
 
 /// Returns the bridged copy, or `None` when no gap exceeds `u16::MAX` (no allocation).
-pub(crate) fn insert_bridges<T: Copy>(components: &[u32], codes: &[T], zero: T) -> Option<(Vec<u32>, Vec<T>)> {
+pub(crate) fn insert_bridges<T: Copy>(
+    components: &[u32],
+    codes: &[T],
+    zero: T,
+) -> Option<(Vec<u32>, Vec<T>)> {
     let mut prev = 0u32;
-    if components.iter().all(|&c| { let ok = c - prev <= MAX_GAP; prev = c; ok }) {
+    if components.iter().all(|&c| {
+        let ok = c - prev <= MAX_GAP;
+        prev = c;
+        ok
+    }) {
         return None;
     }
     let mut out_c = Vec::with_capacity(components.len() + 4);
@@ -27,7 +35,11 @@ pub(crate) fn insert_bridges<T: Copy>(components: &[u32], codes: &[T], zero: T) 
 
 /// Removes the entries whose code is `zero` (bridges; real values never have it, see
 /// `Assumptions.md` #11).
-pub(crate) fn drop_bridges<T: Copy + PartialEq>(components: &mut Vec<u32>, codes: &mut Vec<T>, zero: T) {
+pub(crate) fn drop_bridges<T: Copy + PartialEq>(
+    components: &mut Vec<u32>,
+    codes: &mut Vec<T>,
+    zero: T,
+) {
     let mut kept = 0;
     for i in 0..components.len() {
         if codes[i] != zero {

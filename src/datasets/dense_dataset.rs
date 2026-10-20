@@ -303,8 +303,8 @@ where
     }
 
     #[inline]
-    fn prefetch_with_range(&self, range: std::ops::Range<usize>) {
-        crate::utils::prefetch_read_slice(&self.data.as_ref()[range]);
+    fn prefetch_with_range(&self, range: std::ops::Range<usize>, max_bytes: usize) {
+        crate::utils::prefetch_read_slice(&self.data.as_ref()[range], max_bytes);
     }
 
     fn permute(&self, permutation: &[usize]) -> Self::Owned {
@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(par_values.len(), dataset.len());
         assert_eq!(par_values, iter_values);
 
-        dataset.prefetch_with_range(0..2);
+        dataset.prefetch_with_range(0..2, 256);
     }
 
     #[test]

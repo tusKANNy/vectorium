@@ -1,6 +1,6 @@
 [package]
 name = "vectorium"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 authors = [
     "Rossano Venturini <rossano.venturini@unipi.it>"]
@@ -50,6 +50,11 @@ cli = ["dep:clap", "dep:indicatif"]
 [[bin]]
 name = "compute_groundtruth"
 path = "src/bin/compute_groundtruth.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "kmeans_bench"
+path = "src/bin/kmeans_bench.rs"
 required-features = ["cli"]
 
 

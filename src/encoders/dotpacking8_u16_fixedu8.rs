@@ -2,13 +2,14 @@ use crate::encoders::dotpacking8::encoder::{DotPacking8Encoder, DotPacking8Query
 use crate::encoders::dotpacking8::values::FixedU8Values;
 
 pub type DotPacking8U16FixedU8Encoder = DotPacking8Encoder<u16, FixedU8Values>;
-pub type DotPacking8U16FixedU8QueryEvaluator<'e> = DotPacking8QueryEvaluator<'e, u16, FixedU8Values>;
+pub type DotPacking8U16FixedU8QueryEvaluator<'e> =
+    DotPacking8QueryEvaluator<'e, u16, FixedU8Values>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::distances::Distance;
     use crate::DotProduct;
+    use crate::core::distances::Distance;
     use crate::core::vector::{PackedVectorView, SparseVectorView};
     use crate::vector_encoder::SparseDataEncoder;
     use crate::{
@@ -33,11 +34,11 @@ mod tests {
                 }
             }
 
-            if let Some(&(vec_comp, vec_val)) = vec_iter.peek() {
-                if vec_comp == comp {
-                    expected += FixedU8Q::from_f32_saturating(vec_val).to_f32().unwrap() * val;
-                    vec_iter.next();
-                }
+            if let Some(&(vec_comp, vec_val)) = vec_iter.peek()
+                && vec_comp == comp
+            {
+                expected += FixedU8Q::from_f32_saturating(vec_val).to_f32().unwrap() * val;
+                vec_iter.next();
             }
         }
         expected
@@ -176,9 +177,9 @@ mod tests {
 
         let mut growable = PlainSparseDatasetGrowable::new(quantizer);
 
-        growable.push(input0.clone());
+        growable.push(input0);
 
-        growable.push(input1.clone());
+        growable.push(input1);
 
         encoder.train(&growable);
 
@@ -229,8 +230,14 @@ mod tests {
 
         let d0 = evaluator.compute_distance(dataset.get(0)).distance();
         let d1 = evaluator.compute_distance(dataset.get(1)).distance();
-        assert!((d0 - expected0).abs() < 1e-5, "d0={d0} expected={expected0}");
-        assert!((d1 - expected1).abs() < 1e-5, "d1={d1} expected={expected1}");
+        assert!(
+            (d0 - expected0).abs() < 1e-5,
+            "d0={d0} expected={expected0}"
+        );
+        assert!(
+            (d1 - expected1).abs() < 1e-5,
+            "d1={d1} expected={expected1}"
+        );
 
         // The alias must also satisfy the blanket `IndexSerializer for T: Dataset`.
         let path = std::env::temp_dir().join("vectorium_dotpacking8_fixedu8_round_trip.bin");

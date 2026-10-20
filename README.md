@@ -384,7 +384,7 @@ let dataset: DenseDataset<_> = growable.into();
 
 let id = 0;
 let range = dataset.range_from_id(id);
-dataset.prefetch_with_range(range.clone());
+dataset.prefetch_with_range(range.clone(), 256); // prefetch at most 256 bytes
 let view = dataset.get_with_range(range);
 assert_eq!(view.values(), &[1.0, 0.0, 2.0]);
 ```

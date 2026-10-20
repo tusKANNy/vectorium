@@ -2,8 +2,6 @@
 #![feature(f16)]
 #![allow(internal_features)]
 #![feature(core_intrinsics)]
-#![feature(gen_blocks)]
-#![feature(yield_expr)]
 #![doc = include_str!("../README.md")]
 #![allow(non_snake_case)]
 
@@ -57,21 +55,21 @@ pub use core::vector_encoder::{
 
 pub use clustering::{KMeans, KMeansBuilder, sparse_centroid_pruning};
 
+pub use core::data_block::{BLOCK_SIZE, Block, DataBlock, DataBlockU8, DataBlockU16};
 pub use encoders::blocked_sparse::{
     BlockF16Values, BlockScalarU8Values, BlockScalarU16Values, BlockValues, BlockedSparseEncoder,
     BlockedSparseQueryEvaluator, BlockedSparseScalarU8Encoder, BlockedSparseScalarU16Encoder,
     SPARSE_QUERY_THRESHOLD,
 };
-pub use core::data_block::{Block, DataBlock, DataBlockU8, DataBlockU16, BLOCK_SIZE};
+pub use encoders::rabitq::{
+    RabitqConfig, RabitqQuantizer, RabitqQueryEvaluator, RabitqQueryParams, RabitqSupportedDistance,
+};
+pub use encoders::rabitq_ext::{RabitqExtConfig, RabitqExtQuantizer, RabitqExtQueryEvaluator};
 pub use encoders::sparse_scalar_step::{
     ScalarStepSparseQuantizer, ScalarStepSparseQueryEvaluator, ScalarU8SparseDataset,
     ScalarU8SparseDatasetGrowable, ScalarU8SparseQuantizer, ScalarU16SparseDataset,
     ScalarU16SparseDatasetGrowable, ScalarU16SparseQuantizer, StepCode,
 };
-pub use encoders::rabitq::{
-    RabitqConfig, RabitqQuantizer, RabitqQueryEvaluator, RabitqQueryParams, RabitqSupportedDistance,
-};
-pub use encoders::rabitq_ext::{RabitqExtConfig, RabitqExtQuantizer, RabitqExtQueryEvaluator};
 pub use transformations::fht_kac::FhtKacRotator;
 pub use transformations::l1_prune::{l1_prune_split, l1_prune_split_vector};
 
@@ -80,10 +78,12 @@ pub use encoders::dense_scalar::{
     ScalarDenseQuantizer, ScalarDenseQuantizerDotProduct, ScalarDenseQuantizerSame,
     ScalarDenseQuantizerSquaredEuclidean, ScalarDenseQueryEvaluator, ScalarDenseSupportedDistance,
 };
+pub use encoders::dotpacking8_u16_f16::{
+    DotPacking8U16F16Encoder, DotPacking8U16F16QueryEvaluator,
+};
 pub use encoders::dotpacking8_u16_fixedu8::{
     DotPacking8U16FixedU8Encoder, DotPacking8U16FixedU8QueryEvaluator,
 };
-pub use encoders::dotpacking8_u16_f16::{DotPacking8U16F16Encoder, DotPacking8U16F16QueryEvaluator};
 pub use encoders::dotpacking8_u16_scalar4bit::{
     DotPacking8U16Scalar4BitEncoder, DotPacking8U16Scalar4BitQueryEvaluator,
 };
@@ -93,11 +93,11 @@ pub use encoders::dotpacking8_u16_scalaru8::{
 pub use encoders::dotpacking8_u16_scalaru16::{
     DotPacking8U16ScalarU16Encoder, DotPacking8U16ScalarU16QueryEvaluator,
 };
-pub use encoders::dotpacking8_u32_scalaru16::{
-    BridgedDotPacking8U32ScalarU16Encoder, BridgedDotPacking8U32ScalarU16QueryEvaluator,
-};
 pub use encoders::dotpacking8_u32_scalaru8::{
     BridgedDotPacking8U32ScalarU8Encoder, BridgedDotPacking8U32ScalarU8QueryEvaluator,
+};
+pub use encoders::dotpacking8_u32_scalaru16::{
+    BridgedDotPacking8U32ScalarU16Encoder, BridgedDotPacking8U32ScalarU16QueryEvaluator,
 };
 #[cfg(feature = "multivec")]
 pub use encoders::multivec_pq::{MultiVecPQQueryEvaluator, MultiVecProductQuantizer};
@@ -180,7 +180,8 @@ pub type PlainSparseDatasetGrowable<C, V, D> = SparseDatasetGrowable<PlainSparse
 pub type BlockedSparseDataset = PackedSparseDataset<BlockedSparseEncoder>;
 pub type BlockedSparseDatasetGrowable = PackedSparseDatasetGrowable<BlockedSparseEncoder>;
 pub type BlockedSparseScalarU8Dataset = PackedSparseDataset<BlockedSparseScalarU8Encoder>;
-pub type BlockedSparseScalarU8DatasetGrowable = PackedSparseDatasetGrowable<BlockedSparseScalarU8Encoder>;
+pub type BlockedSparseScalarU8DatasetGrowable =
+    PackedSparseDatasetGrowable<BlockedSparseScalarU8Encoder>;
 pub type BlockedSparseScalarU16Dataset = PackedSparseDataset<BlockedSparseScalarU16Encoder>;
 pub type BlockedSparseScalarU16DatasetGrowable =
     PackedSparseDatasetGrowable<BlockedSparseScalarU16Encoder>;

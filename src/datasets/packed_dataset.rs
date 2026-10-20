@@ -319,8 +319,8 @@ where
     }
 
     #[inline]
-    fn prefetch_with_range(&self, range: std::ops::Range<usize>) {
-        prefetch_read_slice(&self.data.as_ref()[range]);
+    fn prefetch_with_range(&self, range: std::ops::Range<usize>, max_bytes: usize) {
+        prefetch_read_slice(&self.data.as_ref()[range], max_bytes);
     }
 
     fn iter<'a>(&'a self) -> impl Iterator<Item = E::EncodedVector<'a>> {
@@ -458,7 +458,8 @@ where
     }
 }
 
-impl<EIn, S, V> crate::dataset::ConvertFrom<crate::datasets::sparse_dataset::SparseDatasetGeneric<EIn, S>>
+impl<EIn, S, V>
+    crate::dataset::ConvertFrom<crate::datasets::sparse_dataset::SparseDatasetGeneric<EIn, S>>
     for PackedSparseDataset<crate::encoders::blocked_sparse::BlockedSparseEncoder<V>>
 where
     EIn: crate::SparseVectorEncoder<OutputComponentType = u16>,
@@ -503,7 +504,10 @@ where
         for v in dataset.iter() {
             values.clear();
             values.extend(v.values().iter().map(|x| x.to_f32().unwrap()));
-            encoder.push_encoded(crate::SparseVectorView::new(v.components(), &values), &mut data);
+            encoder.push_encoded(
+                crate::SparseVectorView::new(v.components(), &values),
+                &mut data,
+            );
             offsets.push(data.len());
         }
 
@@ -749,7 +753,7 @@ mod tests {
         assert_eq!(dataset.len(), 1);
         assert_eq!(dataset.offsets(), &[0, dataset.data().len()]);
         assert_eq!(dataset.encoder().output_dim(), dim);
-        dataset.prefetch_with_range(0..dataset.data().len());
+        dataset.prefetch_with_range(0..dataset.data().len(), 256);
         let mut iter = dataset.iter();
         assert!(iter.next().is_some());
         assert!(dataset.par_iter().count() > 0);

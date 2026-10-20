@@ -8,18 +8,18 @@ use std::marker::PhantomData;
 use std::simd::{Simd, StdFloat, prelude::*};
 
 use crate::core::sealed;
+use crate::core::storage::SparseStorage;
 use crate::core::vector::{PackedVectorView, SparseVectorView};
 use crate::core::vector_encoder::{
     PackedSparseVectorEncoder, QueryEvaluator, SparseDataEncoder, SparseVectorOwned, VectorEncoder,
 };
+use crate::datasets::sparse_dataset::SparseDatasetGeneric;
 use crate::distances::DotProduct;
 use crate::encoders::dotpacking8::bridges::{drop_bridges, insert_bridges};
 use crate::encoders::dotpacking8::common::{GapDecoder, fast_lane_gather, simd_prefix_sum};
 use crate::encoders::dotpacking8::layout::{EncodedView, write_encoded};
 pub use crate::encoders::dotpacking8::mapping::{ComponentMapping, PackedComponent};
 use crate::encoders::dotpacking8::values::{ValueCodec, ValueReader};
-use crate::core::storage::SparseStorage;
-use crate::datasets::sparse_dataset::SparseDatasetGeneric;
 use crate::{Dataset, SpaceUsage, SparseVectorEncoder, ValueType};
 
 const N: usize = 8;
@@ -44,7 +44,11 @@ impl<C: PackedComponent, V: ValueCodec> DotPacking8Encoder<C, V> {
     }
 
     pub fn with_values(dim: usize, values: V) -> Self {
-        Self { dim, values, mapping: None }
+        Self {
+            dim,
+            values,
+            mapping: None,
+        }
     }
 
     pub fn values(&self) -> &V {
@@ -63,7 +67,11 @@ impl<C: PackedComponent, V: ValueCodec> DotPacking8Encoder<C, V> {
 
     /// Installs a component permutation (e.g. one computed by another ordering).
     pub fn set_component_mapping(&mut self, mapping: ComponentMapping<C>) {
-        assert_eq!(mapping.forward().len(), self.dim, "mapping dimension mismatch");
+        assert_eq!(
+            mapping.forward().len(),
+            self.dim,
+            "mapping dimension mismatch"
+        );
         self.mapping = Some(mapping);
     }
 
@@ -220,7 +228,10 @@ impl<C: PackedComponent, V: ValueCodec> SparseDataEncoder for DotPacking8Encoder
         }
 
         let mut components: Vec<C> = match &self.mapping {
-            Some(m) => comps.iter().map(|&c| m.unmap(C::from_usize(c as usize))).collect(),
+            Some(m) => comps
+                .iter()
+                .map(|&c| m.unmap(C::from_usize(c as usize)))
+                .collect(),
             None => comps.iter().map(|&c| C::from_usize(c as usize)).collect(),
         };
         if self.mapping.is_some() {
@@ -257,7 +268,11 @@ impl<C: PackedComponent, V: ValueCodec> PackedSparseVectorEncoder for DotPacking
             .collect();
         let mut comps: Vec<u32> = match &self.mapping {
             // `map` indexes the permutation, so ids >= dim panic there.
-            Some(m) => input.components().iter().map(|&c| m.map(c).as_() as u32).collect(),
+            Some(m) => input
+                .components()
+                .iter()
+                .map(|&c| m.map(c).as_() as u32)
+                .collect(),
             None => {
                 // Without a mapping the ids are stored as they are and later used as gather
                 // indices into a `dim`-long query (invariant (5)): check them here.
@@ -305,11 +320,13 @@ impl<C: PackedComponent, V: ValueCodec> SpaceUsage for DotPacking8Encoder<C, V> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoders::dotpacking8::values::*;
     use crate::core::vector::{PackedVectorView, SparseVectorView};
+    use crate::encoders::dotpacking8::values::*;
 
     fn encode<C: PackedComponent, V: ValueCodec>(
-        enc: &DotPacking8Encoder<C, V>, comps: &[C], vals: &[f32],
+        enc: &DotPacking8Encoder<C, V>,
+        comps: &[C],
+        vals: &[f32],
     ) -> Vec<u64> {
         let mut out = Vec::new();
         enc.push_encoded(SparseVectorView::new(comps, vals), &mut out);
@@ -332,19 +349,31 @@ mod tests {
     #[test]
     fn roundtrip_all_codecs_all_lengths() {
         let dim = 2000;
-        check_roundtrip(&DotPacking8Encoder::<u16, FixedU8Values>::new(dim), 1.0 / 64.0);
+        check_roundtrip(
+            &DotPacking8Encoder::<u16, FixedU8Values>::new(dim),
+            1.0 / 64.0,
+        );
         check_roundtrip(&DotPacking8Encoder::<u16, F16Values>::new(dim), 0.002);
         check_roundtrip(
-            &DotPacking8Encoder::with_values(dim, ScalarU8Values::from_steps(vec![4.0 / 255.0; dim].into())),
+            &DotPacking8Encoder::with_values(
+                dim,
+                ScalarU8Values::from_steps(vec![4.0 / 255.0; dim].into()),
+            ),
             4.0 / 255.0,
         );
         check_roundtrip(
-            &DotPacking8Encoder::with_values(dim, Scalar4BitValues::from_steps(vec![4.0 / 15.0; dim].into())),
+            &DotPacking8Encoder::with_values(
+                dim,
+                Scalar4BitValues::from_steps(vec![4.0 / 15.0; dim].into()),
+            ),
             4.0 / 15.0,
         );
         // ScalarU16 rounds to the nearest code: error within half a step (+ f32 rounding).
         check_roundtrip(
-            &DotPacking8Encoder::with_values(dim, ScalarU16Values::from_steps(vec![4.0 / 65535.0; dim].into())),
+            &DotPacking8Encoder::with_values(
+                dim,
+                ScalarU16Values::from_steps(vec![4.0 / 65535.0; dim].into()),
+            ),
             2.0 / 65535.0 + 1e-6,
         );
     }
@@ -356,14 +385,25 @@ mod tests {
         let e2 = DotPacking8Encoder::<u16, F16Values>::new(10);
         assert!(encode(&e1, &[], &[]).is_empty());
         assert!(encode(&e2, &[], &[]).is_empty());
-        assert_eq!(e1.query_evaluator(q, &()).compute_distance(PackedVectorView::new(&[])).0, 0.0);
-        assert_eq!(e2.query_evaluator(q, &()).compute_distance(PackedVectorView::new(&[])).0, 0.0);
+        assert_eq!(
+            e1.query_evaluator(q, &())
+                .compute_distance(PackedVectorView::new(&[]))
+                .0,
+            0.0
+        );
+        assert_eq!(
+            e2.query_evaluator(q, &())
+                .compute_distance(PackedVectorView::new(&[]))
+                .0,
+            0.0
+        );
     }
 
     #[test]
     fn u16_decode_keeps_zero_codes() {
         // Value 0.001 is below the 1/255 step: code 0. u16 never has bridges, so it must survive.
-        let enc = DotPacking8Encoder::with_values(10, ScalarU8Values::from_steps(vec![1.0; 10].into()));
+        let enc =
+            DotPacking8Encoder::with_values(10, ScalarU8Values::from_steps(vec![1.0; 10].into()));
         let blob = encode(&enc, &[2u16, 3], &[0.001, 5.0]);
         let d = enc.decode_vector(PackedVectorView::new(&blob));
         assert_eq!(d.components(), &[2, 3]);
@@ -389,7 +429,12 @@ mod tests {
         let d = enc.decode_vector(PackedVectorView::new(&blob));
         assert_eq!(d.components().len(), n);
         let q = SparseVectorView::new(&comps, &vals);
-        assert_eq!(enc.query_evaluator(q, &()).compute_distance(PackedVectorView::new(&blob)).0, n as f32);
+        assert_eq!(
+            enc.query_evaluator(q, &())
+                .compute_distance(PackedVectorView::new(&blob))
+                .0,
+            n as f32
+        );
     }
 
     /// Without a mapping, encoded components are used as gather indices: an id >= dim would
@@ -412,13 +457,16 @@ mod tests {
     // --- Conversion from sparse datasets (`From<SparseDataset>`) ---
 
     use crate::{
-        Dataset, DatasetGrowable, PackedSparseDataset, PackedSparseDatasetGrowable, PlainSparseDataset,
-        PlainSparseDatasetGrowable,
-        PlainSparseQuantizer,
+        Dataset, DatasetGrowable, PackedSparseDataset, PackedSparseDatasetGrowable,
+        PlainSparseDataset, PlainSparseDatasetGrowable, PlainSparseQuantizer,
     };
 
     /// Deterministic skewed sparse vectors with ids in `0..dim` and values in (0.05, 3.9].
-    fn plain_dataset<C: PackedComponent>(dim: usize, n: usize, seed: u64) -> PlainSparseDataset<C, f32, DotProduct> {
+    fn plain_dataset<C: PackedComponent>(
+        dim: usize,
+        n: usize,
+        seed: u64,
+    ) -> PlainSparseDataset<C, f32, DotProduct> {
         let mut x = seed;
         let mut next = move |m: u64| {
             x ^= x >> 12;
@@ -426,18 +474,27 @@ mod tests {
             x ^= x >> 27;
             x.wrapping_mul(0x2545F4914F6CDD1D) % m
         };
-        let mut g = PlainSparseDatasetGrowable::new(PlainSparseQuantizer::<C, f32, DotProduct>::new(dim, dim));
+        let mut g = PlainSparseDatasetGrowable::new(
+            PlainSparseQuantizer::<C, f32, DotProduct>::new(dim, dim),
+        );
         for i in 0..n {
             let len = [0usize, 1, 7, 8, 9, 17, 40, 130][i % 8];
             let mut c: Vec<usize> = Vec::new();
             while c.len() < len {
-                let id = if next(2) == 0 { next(dim as u64 / 100 + 1) } else { next(dim as u64) };
+                let id = if next(2) == 0 {
+                    next(dim as u64 / 100 + 1)
+                } else {
+                    next(dim as u64)
+                };
                 c.push(id as usize);
                 c.sort_unstable();
                 c.dedup();
             }
             let comps: Vec<C> = c.iter().map(|&id| C::from_usize(id)).collect();
-            let vals: Vec<f32> = c.iter().map(|_| 0.05 + next(1000) as f32 * 0.00385).collect();
+            let vals: Vec<f32> = c
+                .iter()
+                .map(|_| 0.05 + next(1000) as f32 * 0.00385)
+                .collect();
             g.push(SparseVectorView::new(&comps, &vals));
         }
         g.into()
@@ -464,7 +521,10 @@ mod tests {
         assert_eq!(converted.offsets(), manual.offsets());
         assert_eq!(converted.data(), manual.data());
         assert_eq!(converted.nnz(), manual.nnz());
-        assert_eq!(converted.encoder().component_mapping(), manual.encoder().component_mapping());
+        assert_eq!(
+            converted.encoder().component_mapping(),
+            manual.encoder().component_mapping()
+        );
     }
 
     #[test]
@@ -485,8 +545,12 @@ mod tests {
         use half::f16;
         let dim = 3000;
         let plain32 = plain_dataset::<u16>(dim, 200, 7);
-        let mut g16 = PlainSparseDatasetGrowable::new(PlainSparseQuantizer::<u16, f16, DotProduct>::new(dim, dim));
-        let mut g32 = PlainSparseDatasetGrowable::new(PlainSparseQuantizer::<u16, f32, DotProduct>::new(dim, dim));
+        let mut g16 = PlainSparseDatasetGrowable::new(
+            PlainSparseQuantizer::<u16, f16, DotProduct>::new(dim, dim),
+        );
+        let mut g32 = PlainSparseDatasetGrowable::new(
+            PlainSparseQuantizer::<u16, f32, DotProduct>::new(dim, dim),
+        );
         for v in plain32.iter() {
             let v16: Vec<f16> = v.values().iter().map(|&x| f16::from_f32(x)).collect();
             let v32: Vec<f32> = v16.iter().map(|x| x.to_f32()).collect();
@@ -508,5 +572,4 @@ mod tests {
         assert_eq!(packed.len(), 0);
         assert_eq!(packed.nnz(), 0);
     }
-
 }

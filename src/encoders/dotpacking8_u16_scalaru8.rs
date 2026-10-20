@@ -2,7 +2,8 @@ use crate::encoders::dotpacking8::encoder::{DotPacking8Encoder, DotPacking8Query
 use crate::encoders::dotpacking8::values::ScalarU8Values;
 
 pub type DotPacking8U16ScalarU8Encoder = DotPacking8Encoder<u16, ScalarU8Values>;
-pub type DotPacking8U16ScalarU8QueryEvaluator<'e> = DotPacking8QueryEvaluator<'e, u16, ScalarU8Values>;
+pub type DotPacking8U16ScalarU8QueryEvaluator<'e> =
+    DotPacking8QueryEvaluator<'e, u16, ScalarU8Values>;
 
 #[cfg(test)]
 mod tests {
@@ -11,12 +12,12 @@ mod tests {
     use crate::core::vector::{PackedVectorView, SparseVectorView};
     use crate::encoders::dotpacking8::values::ValueCodec;
     use crate::encoders::sparse_scalar::PlainSparseQuantizer;
-    use crate::{PlainSparseDataset, SquaredEuclideanDistance};
     use crate::vector_encoder::SparseDataEncoder;
     use crate::{
         DatasetGrowable, PackedSparseVectorEncoder, PlainSparseDatasetGrowable, QueryEvaluator,
         VectorEncoder,
     };
+    use crate::{PlainSparseDataset, SquaredEuclideanDistance};
 
     fn build_training_data(
         dim: usize,

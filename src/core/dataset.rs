@@ -155,8 +155,9 @@ pub trait Dataset: sealed::Sealed {
     /// Iterate through raw encoded vectors for cases where the caller is responsible for decoding.
     fn iter(&self) -> impl Iterator<Item = <Self::Encoder as VectorEncoder>::EncodedVector<'_>>;
 
-    /// Touch the provided range to hint that it will be accessed soon.
-    fn prefetch_with_range(&self, range: std::ops::Range<usize>);
+    /// Touch the provided range to hint that it will be accessed soon, prefetching at most
+    /// `max_bytes` of it (per underlying array). See [`crate::utils::prefetch_read_slice`].
+    fn prefetch_with_range(&self, range: std::ops::Range<usize>, max_bytes: usize);
 
     /// Returns a copy of this dataset whose rows are reordered so that the row currently
     /// at `old_id` ends up at position `permutation[old_id]`.
@@ -220,8 +221,8 @@ where
     }
 
     #[inline]
-    fn prefetch_with_range(&self, range: std::ops::Range<usize>) {
-        (*self).prefetch_with_range(range)
+    fn prefetch_with_range(&self, range: std::ops::Range<usize>, max_bytes: usize) {
+        (*self).prefetch_with_range(range, max_bytes)
     }
 
     #[inline]
@@ -428,12 +429,21 @@ mod tests {
                 2
             );
 
-            <&DenseDataset<Encoder> as Dataset>::prefetch_with_range(&dataset, first_range.clone());
+            <&DenseDataset<Encoder> as Dataset>::prefetch_with_range(
+                &dataset,
+                first_range.clone(),
+                256,
+            );
             <&DenseDataset<Encoder> as Dataset>::prefetch_with_range(
                 &dataset,
                 second_range.clone(),
+                256,
             );
-            <&DenseDataset<Encoder> as Dataset>::prefetch_with_range(&dataset, third_range.clone());
+            <&DenseDataset<Encoder> as Dataset>::prefetch_with_range(
+                &dataset,
+                third_range.clone(),
+                256,
+            );
 
             let first_vector = <&DenseDataset<Encoder> as Dataset>::get(&dataset, 0);
             assert_eq!(first_vector, DenseVectorView::new(&[1.0f32, 0.5]));

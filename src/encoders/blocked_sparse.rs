@@ -8,6 +8,8 @@ use std::marker::PhantomData;
 use core::arch::x86_64::*;
 
 use crate::core::data_block::{BLOCK_SIZE, Block, DataBlock, DataBlockU8, DataBlockU16};
+#[cfg(not(target_arch = "x86_64"))]
+use crate::core::data_block::{BlockValueKind, load_block_portable};
 #[cfg(target_arch = "x86_64")]
 use crate::core::data_block::{hsum256_ps, load_block, match_and_fma_16};
 use crate::core::sealed;
@@ -35,7 +37,12 @@ pub trait BlockValues:
     type Input: ValueType;
     fn new_untrained(dim: usize) -> Self;
     /// Fits per-component parameters on `(components, values)` pairs; no-op by default.
-    fn train<'a, W: ValueType>(&mut self, _dim: usize, _vectors: impl Iterator<Item = (&'a [u16], &'a [W])>) {}
+    fn train<'a, W: ValueType>(
+        &mut self,
+        _dim: usize,
+        _vectors: impl Iterator<Item = (&'a [u16], &'a [W])>,
+    ) {
+    }
     fn encode(&self, component: usize, value: f32) -> <Self::Block as Block>::Value;
     fn decode(&self, component: usize, value: <Self::Block as Block>::Value) -> f32;
     /// Query value as stored in the evaluator, scaled so `query · value_to_f32(stored)` is the
@@ -174,7 +181,10 @@ impl<V: BlockValues> BlockedSparseEncoder<V> {
             "Dimension {} exceeds u16 range",
             dim
         );
-        Self { dim, values: V::new_untrained(dim) }
+        Self {
+            dim,
+            values: V::new_untrained(dim),
+        }
     }
 
     /// The value format (and, for scalar codes, the trained steps).
@@ -184,8 +194,10 @@ impl<V: BlockValues> BlockedSparseEncoder<V> {
 
     /// Fits the value codec on `training_data` (no-op for `f16`). Accepts any sparse dataset
     /// with `u16` components and any value type; the data is read in place, never copied.
-    pub fn train<E, S>(&mut self, training_data: &crate::datasets::sparse_dataset::SparseDatasetGeneric<E, S>)
-    where
+    pub fn train<E, S>(
+        &mut self,
+        training_data: &crate::datasets::sparse_dataset::SparseDatasetGeneric<E, S>,
+    ) where
         E: crate::SparseVectorEncoder<OutputComponentType = u16>,
         E::OutputValueType: ValueType,
         S: crate::core::storage::SparseStorage<E>,
@@ -214,10 +226,13 @@ impl<V: BlockValues> BlockedSparseEncoder<V> {
         for chunk in components.chunks(BLOCK_SIZE) {
             // Padding: component = last real component, value = zero (the default).
             let last = chunk[chunk.len() - 1];
-            let comps: [u16; BLOCK_SIZE] = std::array::from_fn(|i| chunk.get(i).copied().unwrap_or(last));
+            let comps: [u16; BLOCK_SIZE] =
+                std::array::from_fn(|i| chunk.get(i).copied().unwrap_or(last));
             let mut vals = [<V::Block as Block>::Value::default(); BLOCK_SIZE];
             for (slot, &c) in vals.iter_mut().zip(chunk) {
-                *slot = self.values.encode(c as usize, values.next().expect("one value per component"));
+                *slot = self
+                    .values
+                    .encode(c as usize, values.next().expect("one value per component"));
             }
             output.extend(std::iter::once(V::Block::new(comps, vals)));
         }
@@ -284,7 +299,10 @@ impl<V: BlockValues> SparseDataEncoder for BlockedSparseEncoder<V> {
             // Padding is recognised by its repeated component, not by its (zero) value.
             for i in 0..block.len() {
                 components.push(block.components()[i]);
-                values.push(self.values.decode(block.components()[i] as usize, block.values()[i]));
+                values.push(
+                    self.values
+                        .decode(block.components()[i] as usize, block.values()[i]),
+                );
             }
         }
 
@@ -433,9 +451,65 @@ impl<V: BlockValues> BlockedSparseQueryEvaluator<V> {
             DotProduct::from(hsum256_ps(sum))
         }
     }
+
+    /// JumpDot for targets without AVX2 (NEON on aarch64), in portable SIMD: the same algorithm
+    /// as the AVX2 kernel. Compare the 16 components with the query component, keep the matching
+    /// 16-bit value lane, OR the two halves (at most one real match per block; zero-valued padding
+    /// may match too), widen the 8 lanes to `f32` and FMA into the accumulator.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline]
+    fn compute_distance_jump_dot(
+        query: SparseVectorView<'_, u16, f32>,
+        vector: PackedVectorView<'_, V::Block>,
+    ) -> DotProduct {
+        use std::simd::{
+            Select, Simd, StdFloat, cmp::SimdPartialEq, num::SimdFloat, num::SimdUint,
+        };
+
+        let query_components = query.components();
+        let query_values = query.values();
+        if query_components.is_empty() {
+            return DotProduct::from(0.0f32);
+        }
+        let kind = <V::Block as Block>::KIND;
+        let mut cur_q = 0;
+        let mut sum = Simd::<f32, 8>::splat(0.0);
+
+        'block_loop: for block in vector.data() {
+            if query_components[cur_q] <= block.last_component() {
+                let (comps, vals) = load_block_portable(block);
+                while query_components[cur_q] <= block.last_component() {
+                    let matched = comps
+                        .simd_eq(Simd::splat(query_components[cur_q]))
+                        .select(vals, Simd::splat(0));
+                    let (lo, hi): (Simd<u16, 8>, Simd<u16, 8>) = (
+                        matched.resize::<8>(0),
+                        matched.rotate_elements_left::<8>().resize::<8>(0),
+                    );
+                    let merged = lo | hi;
+                    let f: Simd<f32, 8> =
+                        match kind {
+                            // `f16_to_f32` vectorizes to `fcvtl` on aarch64.
+                            BlockValueKind::F16 => Simd::from_array(merged.to_array().map(|b| {
+                                crate::utils::numeric_markers::f16_to_f32(f16::from_bits(b))
+                            })),
+                            BlockValueKind::U16 | BlockValueKind::U8 => merged.cast(),
+                        };
+                    sum = f.mul_add(Simd::splat(query_values[cur_q]), sum);
+                    cur_q += 1;
+                    if cur_q >= query_components.len() {
+                        break 'block_loop;
+                    }
+                }
+            }
+        }
+        DotProduct::from(sum.reduce_sum())
+    }
 }
 
-impl<'v, V: BlockValues> QueryEvaluator<PackedVectorView<'v, V::Block>> for BlockedSparseQueryEvaluator<V> {
+impl<'v, V: BlockValues> QueryEvaluator<PackedVectorView<'v, V::Block>>
+    for BlockedSparseQueryEvaluator<V>
+{
     type Distance = DotProduct;
 
     #[inline]
@@ -451,9 +525,7 @@ impl<'v, V: BlockValues> QueryEvaluator<PackedVectorView<'v, V::Block>> for Bloc
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
-                let _ = query;
-                // Fallback: densify on the fly (shouldn't happen in practice).
-                panic!("jump_dot sparse path requires x86_64 with AVX2/F16C/FMA");
+                Self::compute_distance_jump_dot(query, vector)
             }
         }
     }
@@ -906,12 +978,19 @@ mod tests {
             .map(|&len| {
                 let mut c: Vec<u16> = Vec::new();
                 while c.len() < len {
-                    let id = if next(2) == 0 { next(dim / 100 + 1) } else { next(dim) };
+                    let id = if next(2) == 0 {
+                        next(dim / 100 + 1)
+                    } else {
+                        next(dim)
+                    };
                     c.push(id as u16);
                     c.sort_unstable();
                     c.dedup();
                 }
-                let v = c.iter().map(|_| 0.05 + next(1000) as f32 * 0.00385).collect();
+                let v = c
+                    .iter()
+                    .map(|_| 0.05 + next(1000) as f32 * 0.00385)
+                    .collect();
                 (c, v)
             })
             .collect()
@@ -920,7 +999,11 @@ mod tests {
     #[test]
     fn golden_blocked_f16() {
         let dim = 30_000u64;
-        let docs = golden_vectors(dim, 0x9E3779B97F4A7C15, &[0, 1, 15, 16, 17, 31, 32, 33, 64, 130, 3, 40]);
+        let docs = golden_vectors(
+            dim,
+            0x9E3779B97F4A7C15,
+            &[0, 1, 15, 16, 17, 31, 32, 33, 64, 130, 3, 40],
+        );
         // Short queries (jump_dot) and long queries (dense path).
         let queries = golden_vectors(dim, 0xD1B54A32D192ED03, &[1, 5, 20, 32, 33, 60, 100]);
 
@@ -942,7 +1025,11 @@ mod tests {
         for (qc, qv) in &queries {
             let eval = encoder.query_evaluator(SparseVectorView::new(qc, qv), &());
             for blob in &blobs {
-                scores.push(eval.compute_distance(PackedVectorView::new(blob)).distance().to_bits() as u64);
+                scores.push(
+                    eval.compute_distance(PackedVectorView::new(blob))
+                        .distance()
+                        .to_bits() as u64,
+                );
             }
         }
         let mut decoded: Vec<u64> = Vec::new();
@@ -953,8 +1040,14 @@ mod tests {
             decoded.push(u64::MAX);
         }
         let got = (golden_fnv(words), golden_fnv(scores), golden_fnv(decoded));
-        println!("golden_blocked_f16: {:#018x}, {:#018x}, {:#018x}", got.0, got.1, got.2);
-        assert_eq!(got, (0x946376a33e72e409, 0x67dd56f9d19e69d3, 0x92677293522f8f3b));
+        println!(
+            "golden_blocked_f16: {:#018x}, {:#018x}, {:#018x}",
+            got.0, got.1, got.2
+        );
+        assert_eq!(
+            got,
+            (0x946376a33e72e409, 0x67dd56f9d19e69d3, 0x92677293522f8f3b)
+        );
     }
 
     /// A real value can be stored as zero (an f16 underflow here; a quantized code 0 for the
@@ -978,10 +1071,20 @@ mod tests {
     // Scalar blocks (ScalarU8 / ScalarU16)
     // -----------------------------------------------------------------------
 
-    fn scalar_plain(dim: usize, n: usize, seed: u64) -> crate::PlainSparseDataset<u16, f32, DotProduct> {
+    fn scalar_plain(
+        dim: usize,
+        n: usize,
+        seed: u64,
+    ) -> crate::PlainSparseDataset<u16, f32, DotProduct> {
         use crate::{DatasetGrowable, PlainSparseDatasetGrowable, PlainSparseQuantizer};
-        let mut g = PlainSparseDatasetGrowable::new(PlainSparseQuantizer::<u16, f32, DotProduct>::new(dim, dim));
-        for (c, v) in golden_vectors(dim as u64, seed, &[0, 1, 15, 16, 17, 33, 64, 130, 7, 40].repeat(n / 10 + 1)[..n]) {
+        let mut g = PlainSparseDatasetGrowable::new(
+            PlainSparseQuantizer::<u16, f32, DotProduct>::new(dim, dim),
+        );
+        for (c, v) in golden_vectors(
+            dim as u64,
+            seed,
+            &[0, 1, 15, 16, 17, 33, 64, 130, 7, 40].repeat(n / 10 + 1)[..n],
+        ) {
             g.push(SparseVectorView::new(&c, &v));
         }
         g.into()
@@ -1017,14 +1120,24 @@ mod tests {
         for (qc, qv) in &queries {
             let eval = encoder.query_evaluator(SparseVectorView::new(qc, qv), &());
             for blob in &manual {
-                let got = eval.compute_distance(PackedVectorView::new(blob)).distance();
+                let got = eval
+                    .compute_distance(PackedVectorView::new(blob))
+                    .distance();
                 let d = encoder.decode_vector(PackedVectorView::new(blob));
                 let want: f32 = qc
                     .iter()
                     .zip(qv)
-                    .filter_map(|(c, q)| d.components().binary_search(c).ok().map(|i| q * d.values()[i]))
+                    .filter_map(|(c, q)| {
+                        d.components()
+                            .binary_search(c)
+                            .ok()
+                            .map(|i| q * d.values()[i])
+                    })
                     .sum();
-                assert!((got - want).abs() <= 1e-4 * (1.0 + want.abs()), "{got} vs {want}");
+                assert!(
+                    (got - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                    "{got} vs {want}"
+                );
             }
         }
 

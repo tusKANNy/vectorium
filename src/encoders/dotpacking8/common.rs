@@ -29,9 +29,6 @@
 use half::f16;
 use std::simd::Simd;
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{__m256, __m256i};
-
 use crate::{
     encoders::dotpacking8::swizzle::fast_lane_swizzle, utils::load128_and_broadcast_to_256,
 };
@@ -136,20 +133,22 @@ pub fn simd_prefix_sum(mut n: Simd<u32, N>) -> Simd<u32, N> {
 #[inline(always)]
 pub unsafe fn fast_lane_gather(query_ptr: &[f32], components: Simd<u32, N>) -> Simd<f32, N> {
     debug_assert!(
-        components.to_array().iter().all(|&c| (c as usize) < query_ptr.len()),
+        components
+            .to_array()
+            .iter()
+            .all(|&c| (c as usize) < query_ptr.len()),
         "gather index out of bounds"
     );
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use std::arch::x86_64::*;
-        let q_vals: __m256 =
-            _mm256_i32gather_ps(query_ptr.as_ptr(), components.into(), 4);
+        let q_vals: __m256 = _mm256_i32gather_ps(query_ptr.as_ptr(), components.into(), 4);
         Simd::<f32, N>::from(q_vals)
     }
 
     #[cfg(not(target_arch = "x86_64"))]
     unsafe {
-        use std::simd::Mask;
+        use std::simd::{Mask, num::SimdUint};
         Simd::gather_select_unchecked(
             query_ptr,
             Mask::splat(true),
@@ -213,7 +212,13 @@ impl<'a> GapDecoder<'a> {
     /// (invariants (1)-(3)): 16 bytes must be readable from the start of every block of `payload`.
     #[inline(always)]
     pub(crate) unsafe fn new(n: usize, selectors: &'a [u8], payload: &'a [u8]) -> Self {
-        Self { n, bulk_blocks: n / N, block_idx: 0, selectors, payload_ptr: payload.as_ptr() }
+        Self {
+            n,
+            bulk_blocks: n / N,
+            block_idx: 0,
+            selectors,
+            payload_ptr: payload.as_ptr(),
+        }
     }
 
     #[inline(always)]
@@ -278,33 +283,20 @@ pub unsafe fn f16_ptr_to_f32x8(ptr: *const f16) -> Simd<f32, 8> {
             std::mem::transmute(m256)
         }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "f16c")))]
+    // `half::f16::to_f32` does not vectorize on aarch64; `f16_to_f32` lowers to two `fcvtl`.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let bits = unsafe { ptr.cast::<[u16; 8]>().read_unaligned() };
+        Simd::<f32, 8>::from_array(
+            bits.map(|b| crate::utils::numeric_markers::f16_to_f32(f16::from_bits(b))),
+        )
+    }
+    #[cfg(not(any(
+        all(target_arch = "x86_64", target_feature = "f16c"),
+        target_arch = "aarch64"
+    )))]
     {
         let val_f32: [f32; 8] = std::array::from_fn(|i| (unsafe { *ptr.add(i) }).to_f32());
         Simd::<f32, 8>::from_array(val_f32)
     }
-}
-
-/// Add `query_value * vbits[i]` to `acc` in every lane `i` where `comps[i] == query_component`.
-///
-/// # Safety
-///
-/// The CPU must support AVX2 and FMA.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[target_feature(enable = "fma")]
-#[inline]
-pub unsafe fn match_and_fma_8(
-    query_component: u32,
-    query_value: f32,
-    comps: __m256i,
-    vbits: __m256,
-    acc: &mut __m256,
-) {
-    use std::arch::x86_64::*;
-    let q32: __m256i = _mm256_set1_epi32(query_component as i32);
-    let cmp: __m256i = _mm256_cmpeq_epi32(comps, q32);
-    let vbits_masked: __m256 = _mm256_and_ps(vbits, _mm256_castsi256_ps(cmp));
-    let scale: __m256 = _mm256_set1_ps(query_value);
-    *acc = _mm256_fmadd_ps(vbits_masked, scale, *acc);
 }

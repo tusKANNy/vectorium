@@ -67,6 +67,21 @@ mod builtin {
     pub(super) type F16 = f16;
 }
 
+/// `half::f16` -> `f32` for the packed/blocked kernels. On aarch64 `half` converts out of line
+/// (runtime `fp16` detection + call per value, or inline asm with `fp16` enabled), which also
+/// blocks vectorization; the built-in `f16` cast inlines to `fcvt`/`fcvtl`. Elsewhere `half`.
+#[inline(always)]
+pub(crate) fn f16_to_f32(h: f16) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        builtin::F16::from_bits(h.to_bits()) as f32
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        h.to_f32()
+    }
+}
+
 /// Widens a stored value to `f32` inside distance kernels.
 ///
 /// `half::f16`'s conversion is inline asm (`fcvt`) on aarch64 with the `fp16` target feature, and

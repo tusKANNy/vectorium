@@ -3,7 +3,31 @@
 Changes that matter to crates depending on vectorium (kANNolo, Seismic).
 Newest entries go at the top of each section.
 
-## [0.11.0] - unreleased (branch `compression`)
+## [0.11.1] - 2026-10-21
+
+Dependents: change the vectorium dependency to `0.11.1` (git tag `v0.11.1`). kANNolo must move
+together with this release (one-line change, see Breaking changes).
+
+### Breaking changes (relative to 0.11.0)
+
+| Change | Who is hit | Migration |
+|---|---|---|
+| `Dataset::prefetch_with_range(range, max_bytes)` and `utils::prefetch_read_slice(data, max_bytes)` take the prefetch cap from the caller (0.11.0: a fixed 512 bytes; 0.10.0: 256). One cap cannot serve both access patterns: 512 is what Seismic's posting-block scans want (`eb4ca45`), 256 is what kANNolo's HNSW search wants (512 made it 3-6% slower). | Every caller of `prefetch_with_range` / `prefetch_read_slice` and every external `Dataset` impl. kANNolo: `src/graph/graph.rs`. Seismic: wherever it prefetches through vectorium. | kANNolo passes `256` (same as 0.10.0); Seismic passes `512` (same as 0.11.0). |
+
+### Fixes
+
+- Non-x86 builds: `dotpacking8` compiles again (missing `SimdUint` import on the portable gather path; failed the aarch64 CI), and blocked-sparse jump_dot no longer panics outside x86_64.
+- `kmeans_bench` compiles again (new `KMeansBuilder::train` signature) and, like `compute_groundtruth`, requires the `cli` feature.
+- Removed the unused nightly features `gen_blocks` and `yield_expr` (left over from DotVByte) and the unused `encoders::dotpacking8::common::match_and_fma_8`. `cargo clippy --all-targets --all-features` is clean on x86_64 and aarch64.
+
+### Performance-relevant changes
+
+| Change |
+|---|
+| Prefetch cap per caller (see above). Measured on kANNolo HNSW (fiqa SPLADE-v3, u16, M=32, efC=200, 1 thread), 512 vs 256 bytes: +3.1% to +6.1% query time across ef 10-320 for f32 and f16; with 256, kANNolo develop matches main (vectorium 0.10.0) within 0.4%. Recall identical. |
+| aarch64 kernels for the packed and blocked encoders (x86 code unchanged: everything is under `cfg(target_arch = "aarch64")` or non-x86). DotPacking8: the gap decoder's 32-byte shuffle is two NEON `vqtbl1q_u8` instead of a scalar byte loop, and `f16` values widen with `fcvtl` instead of eight scalar `half` conversions. Blocked: jump_dot (queries with < 33 components) is a portable-SIMD port of the AVX2 kernel (`cmeq` + `fcvtl`/`ucvtf` + `fmla` on NEON), and the dense path's `f16` widening is inlined. `half::f16::to_f32` on aarch64 is an out-of-line call with runtime `fp16` detection per value; the kernels now use `numeric_markers::f16_to_f32` (built-in `f16` cast on aarch64, `half` elsewhere). Verified under qemu (aarch64 test suite; DotPacking8 golden score hashes identical to x86) and by inspecting the generated assembly; not timed on ARM hardware. |
+
+## [0.11.0] - not tagged (branch `compression`, merged into `main` at `ab18e9e`)
 
 This branch (`compression`) started from `main` at `3fedb2f` (0.4.0) and has since merged
 `origin/main` up to its 0.10.0 (`5850880`). The tables below list what `compression` adds or changes;

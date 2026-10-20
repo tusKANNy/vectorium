@@ -102,7 +102,11 @@ where
 {
     /// An untrained quantizer (all steps 0) for components in `0..dim`.
     pub fn new(dim: usize) -> Self {
-        Self { dim, steps: vec![0.0; dim].into_boxed_slice(), _phantom: PhantomData }
+        Self {
+            dim,
+            steps: vec![0.0; dim].into_boxed_slice(),
+            _phantom: PhantomData,
+        }
     }
 
     /// Sets each component's step to its largest value in `training_data` divided by
@@ -133,7 +137,11 @@ where
     #[inline]
     fn encode_value(&self, component: C, value: f32) -> Code {
         let step = self.steps[component.as_()];
-        if step > 0.0 { Code::from_scaled(value / step) } else { Code::default() }
+        if step > 0.0 {
+            Code::from_scaled(value / step)
+        } else {
+            Code::default()
+        }
     }
 }
 
@@ -150,7 +158,10 @@ where
     type OutputComponentType = C;
     type OutputValueType = Code;
 
-    fn decode_vector<'a>(&self, encoded: SparseVectorView<'a, C, Code>) -> SparseVectorOwned<C, f32> {
+    fn decode_vector<'a>(
+        &self,
+        encoded: SparseVectorView<'a, C, Code>,
+    ) -> SparseVectorOwned<C, f32> {
         let values = encoded
             .components()
             .iter()
@@ -178,7 +189,11 @@ where
     {
         components.extend(input.components().iter().copied());
         values.extend(
-            input.components().iter().zip(input.values()).map(|(&c, &v)| self.encode_value(c, v)),
+            input
+                .components()
+                .iter()
+                .zip(input.values())
+                .map(|(&c, &v)| self.encode_value(c, v)),
         );
     }
 }
@@ -260,15 +275,25 @@ where
     ) -> Self {
         let dim = quantizer.dim;
         for &c in query.components() {
-            assert!(c.as_() < dim, "Query vector component exceeds quantizer input dimension.");
+            assert!(
+                c.as_() < dim,
+                "Query vector component exceeds quantizer input dimension."
+            );
         }
         let steps = &quantizer.steps[..];
         let query_norm = if D::requires_dot_query() {
-            query.values().iter().fold(0.0f32, |acc, &v| acc.algebraic_add(v.algebraic_mul(v)))
+            query
+                .values()
+                .iter()
+                .fold(0.0f32, |acc, &v| acc.algebraic_add(v.algebraic_mul(v)))
         } else {
             0.0
         };
-        let scaled = query.components().iter().zip(query.values()).map(|(&c, &v)| v * steps[c.as_()]);
+        let scaled = query
+            .components()
+            .iter()
+            .zip(query.values())
+            .map(|(&c, &v)| v * steps[c.as_()]);
 
         let (dense_query, sparse_query) = if dim < SPARSE_QUERY_MIN_DIM {
             let mut dense = vec![0.0f32; dim];
@@ -281,10 +306,22 @@ where
                 is_strictly_sorted(query.components()),
                 "Query components must be sorted in strictly ascending order."
             );
-            (None, Some(SparseVectorOwned::new(query.components().to_vec(), scaled.collect())))
+            (
+                None,
+                Some(SparseVectorOwned::new(
+                    query.components().to_vec(),
+                    scaled.collect(),
+                )),
+            )
         };
 
-        Self { dense_query, sparse_query, query_norm, steps, _phantom: PhantomData }
+        Self {
+            dense_query,
+            sparse_query,
+            query_norm,
+            steps,
+            _phantom: PhantomData,
+        }
     }
 
     /// `Σ query[c] · step_c · code_c`.
@@ -310,10 +347,14 @@ where
     /// `‖x‖² = Σ (step_c · code_c)²`.
     #[inline]
     fn vector_norm(&self, vector: SparseVectorView<'_, C, Code>) -> f32 {
-        vector.components().iter().zip(vector.values()).fold(0.0f32, |acc, (&c, &code)| {
-            let x = code.to_f32() * self.steps[c.as_()];
-            acc.algebraic_add(x.algebraic_mul(x))
-        })
+        vector
+            .components()
+            .iter()
+            .zip(vector.values())
+            .fold(0.0f32, |acc, (&c, &code)| {
+                let x = code.to_f32() * self.steps[c.as_()];
+                acc.algebraic_add(x.algebraic_mul(x))
+            })
     }
 
     #[inline]
@@ -365,7 +406,8 @@ where
 /// Builds a trained ScalarU8/ScalarU16 sparse dataset from a plain (or cast-quantized) sparse
 /// dataset: trains the steps on `source`, then encodes every vector. Values of any float type
 /// are widened to `f32` per vector; `source` is not copied.
-impl<C, SrcIn, Mid, Code, D, S> ConvertFrom<SparseDatasetGeneric<ScalarSparseQuantizer<C, SrcIn, Mid, D>, S>>
+impl<C, SrcIn, Mid, Code, D, S>
+    ConvertFrom<SparseDatasetGeneric<ScalarSparseQuantizer<C, SrcIn, Mid, D>, S>>
     for SparseDataset<ScalarStepSparseQuantizer<C, Code, D>>
 where
     C: ComponentType,
@@ -407,7 +449,10 @@ mod tests {
     use half::f16;
 
     /// Deterministic skewed sparse vectors with ids in `0..dim` and values in (0.05, 3.9].
-    fn plain<C: ComponentType + num_traits::FromPrimitive, D: ScalarSparseSupportedDistance + From<f32>>(
+    fn plain<
+        C: ComponentType + num_traits::FromPrimitive,
+        D: ScalarSparseSupportedDistance + From<f32>,
+    >(
         dim: usize,
         n: usize,
         seed: u64,
@@ -419,18 +464,26 @@ mod tests {
             x ^= x >> 27;
             x.wrapping_mul(0x2545F4914F6CDD1D) % m
         };
-        let mut g = PlainSparseDatasetGrowable::new(PlainSparseQuantizer::<C, f32, D>::new(dim, dim));
+        let mut g =
+            PlainSparseDatasetGrowable::new(PlainSparseQuantizer::<C, f32, D>::new(dim, dim));
         for i in 0..n {
             let len = [0usize, 1, 7, 16, 17, 40, 130][i % 7];
             let mut c: Vec<usize> = Vec::new();
             while c.len() < len {
-                let id = if next(2) == 0 { next(dim as u64 / 100 + 1) } else { next(dim as u64) };
+                let id = if next(2) == 0 {
+                    next(dim as u64 / 100 + 1)
+                } else {
+                    next(dim as u64)
+                };
                 c.push(id as usize);
                 c.sort_unstable();
                 c.dedup();
             }
             let comps: Vec<C> = c.iter().map(|&id| C::from_usize(id).unwrap()).collect();
-            let vals: Vec<f32> = c.iter().map(|_| 0.05 + next(1000) as f32 * 0.00385).collect();
+            let vals: Vec<f32> = c
+                .iter()
+                .map(|_| 0.05 + next(1000) as f32 * 0.00385)
+                .collect();
             g.push(SparseVectorView::new(&comps, &vals));
         }
         g.into()
@@ -456,7 +509,10 @@ mod tests {
             for ((&c, &x), &y) in v.components().iter().zip(v.values()).zip(decoded.values()) {
                 let step = q.steps()[c as usize];
                 // Half a step, plus f32 rounding of `v / step` and `code * step`.
-                assert!((x - y).abs() <= step / 2.0 + x.abs() * 1e-6, "c={c}: {x} vs {y}, step {step}");
+                assert!(
+                    (x - y).abs() <= step / 2.0 + x.abs() * 1e-6,
+                    "c={c}: {x} vs {y}, step {step}"
+                );
             }
         }
     }
@@ -472,22 +528,35 @@ mod tests {
         let untrained = ScalarStepSparseQuantizer::<u16, u8, DotProduct>::new(10);
         let mut comps = Vec::new();
         let mut codes = Vec::new();
-        untrained.push_encoded(SparseVectorView::new(&[3u16, 7], &[1.0f32, 2.0]), &mut comps, &mut codes);
+        untrained.push_encoded(
+            SparseVectorView::new(&[3u16, 7], &[1.0f32, 2.0]),
+            &mut comps,
+            &mut codes,
+        );
         assert_eq!(codes, vec![0u8, 0]);
 
         // Component 9 never occurs in training: step 0, code 0, no division by zero.
-        let mut g = PlainSparseDatasetGrowable::new(PlainSparseQuantizer::<u16, f32, DotProduct>::new(10, 10));
+        let mut g = PlainSparseDatasetGrowable::new(
+            PlainSparseQuantizer::<u16, f32, DotProduct>::new(10, 10),
+        );
         g.push(SparseVectorView::new(&[1u16, 2], &[1.0f32, 0.5]));
         let data: PlainSparseDataset<u16, f32, DotProduct> = g.into();
         let q = trained::<u16, DotProduct>(&data);
         assert_eq!(q.steps()[9], 0.0);
         let (mut comps, mut codes) = (Vec::new(), Vec::new());
-        q.push_encoded(SparseVectorView::new(&[1u16, 9], &[1.0f32, 3.0]), &mut comps, &mut codes);
+        q.push_encoded(
+            SparseVectorView::new(&[1u16, 9], &[1.0f32, 3.0]),
+            &mut comps,
+            &mut codes,
+        );
         assert_eq!(codes, vec![u16::MAX, 0]);
     }
 
     /// Reference score: the f32 distance between the query and the decoded vector.
-    fn reference<D: ScalarSparseSupportedDistance + From<f32>>(q: SparseVectorView<'_, u16, f32>, x: &SparseVectorOwned<u16, f32>) -> f32 {
+    fn reference<D: ScalarSparseSupportedDistance + From<f32>>(
+        q: SparseVectorView<'_, u16, f32>,
+        x: &SparseVectorOwned<u16, f32>,
+    ) -> f32 {
         let mut dot = 0.0f32;
         for (c, v) in q.iter() {
             if let Ok(i) = x.components().binary_search(&c) {
@@ -522,7 +591,10 @@ mod tests {
                 let view = SparseVectorView::new(c, x);
                 let got = ev.compute_distance(view).distance();
                 let want = reference::<D>(query, &q.decode_vector(view));
-                assert!((got - want).abs() <= 1e-4 * (1.0 + want.abs()), "dim {dim}: {got} vs {want}");
+                assert!(
+                    (got - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                    "dim {dim}: {got} vs {want}"
+                );
             }
             // Six vectors at once must equal six single calls.
             for chunk in encoded.chunks_exact(6).take(5) {
@@ -591,8 +663,12 @@ mod tests {
     fn conversion_accepts_f16_values() {
         let dim = 3000;
         let d32 = plain::<u16, DotProduct>(dim, 200, 8);
-        let mut g16 = PlainSparseDatasetGrowable::new(PlainSparseQuantizer::<u16, f16, DotProduct>::new(dim, dim));
-        let mut g32 = PlainSparseDatasetGrowable::new(PlainSparseQuantizer::<u16, f32, DotProduct>::new(dim, dim));
+        let mut g16 = PlainSparseDatasetGrowable::new(
+            PlainSparseQuantizer::<u16, f16, DotProduct>::new(dim, dim),
+        );
+        let mut g32 = PlainSparseDatasetGrowable::new(
+            PlainSparseQuantizer::<u16, f32, DotProduct>::new(dim, dim),
+        );
         for v in d32.iter() {
             let h: Vec<f16> = v.values().iter().map(|&x| f16::from_f32(x)).collect();
             let w: Vec<f32> = h.iter().map(|x| x.to_f32()).collect();

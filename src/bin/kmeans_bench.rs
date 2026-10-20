@@ -53,7 +53,12 @@ fn main() {
     );
 
     let t0 = Instant::now();
-    let centroids = builder.train(&dataset, args.n_clusters, None);
+    let centroids: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> = builder.train(
+        &dataset,
+        args.n_clusters,
+        None,
+        PlainDenseQuantizer::new(dataset.output_dim()),
+    );
     let elapsed = t0.elapsed();
 
     println!("Training finished in {:.3?}", elapsed);

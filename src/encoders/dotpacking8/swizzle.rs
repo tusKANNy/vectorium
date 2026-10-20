@@ -136,8 +136,8 @@ unsafe fn avx2_pshufb(bytes: Simd<u8, 32>, idxs: Simd<u8, 32>) -> Simd<u8, 32> {
     use core::arch::x86;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64 as x86;
-    use std::simd::cmp::SimdPartialOrd;
     use std::simd::Select;
+    use std::simd::cmp::SimdPartialOrd;
     use x86::_mm256_permute2x128_si256 as avx2_cross_shuffle;
     use x86::_mm256_shuffle_epi8 as avx2_half_pshufb;
     let mid = Simd::splat(16u8);
@@ -171,20 +171,37 @@ unsafe fn avx2_pshufb(bytes: Simd<u8, 32>, idxs: Simd<u8, 32>) -> Simd<u8, 32> {
 /// A faster version of swizzle for 32-byte vectors on AVX2.
 /// This version performs only lane-local shuffles, which is sufficient
 /// when the input 'bytes' is a 16-byte broadcast (as in block8).
-/// On non-x86_64 platforms, it falls back to the standard swizzle.
+/// On aarch64 it uses two NEON table lookups; elsewhere it falls back to the standard swizzle.
 #[inline(always)]
 #[allow(dead_code)]
 pub fn fast_lane_swizzle(bytes: Simd<u8, 32>, idxs: Simd<u8, 32>) -> Simd<u8, 32> {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        use core::arch::x86_64::_mm256_shuffle_epi8;
         use core::arch::x86_64::__m256i;
+        use core::arch::x86_64::_mm256_shuffle_epi8;
         mem::transmute::<__m256i, Simd<u8, 32>>(_mm256_shuffle_epi8(
             mem::transmute::<Simd<u8, 32>, __m256i>(bytes),
             mem::transmute::<Simd<u8, 32>, __m256i>(idxs),
         ))
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    // NEON has no 32-byte shuffle: look up each 16-byte half of `idxs` in the low half of
+    // `bytes` (a 16-byte broadcast, so both halves are equal). `vqtbl1q_u8` returns 0 for indices
+    // >= 16, where `vpshufb` reads index & 15. Either is fine: a block's 8 gaps take at most
+    // 8 * 16 bits, so every bit the decoder keeps lies in bytes 0..16 and the rest is masked off.
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    unsafe {
+        use core::arch::aarch64::{uint8x16_t, vqtbl1q_u8};
+        let table: uint8x16_t = mem::transmute(*bytes.as_array().first_chunk::<16>().unwrap());
+        let [lo, hi]: [uint8x16_t; 2] = mem::transmute(idxs);
+        mem::transmute::<[uint8x16_t; 2], Simd<u8, 32>>([
+            vqtbl1q_u8(table, lo),
+            vqtbl1q_u8(table, hi),
+        ])
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    )))]
     {
         swizzle(bytes, idxs)
     }

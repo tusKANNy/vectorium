@@ -24,19 +24,20 @@ use crate::encoders::dotpacking8::encoder::{DotPacking8Encoder, DotPacking8Query
 use crate::encoders::dotpacking8::values::Scalar4BitValues;
 
 pub type DotPacking8U16Scalar4BitEncoder = DotPacking8Encoder<u16, Scalar4BitValues>;
-pub type DotPacking8U16Scalar4BitQueryEvaluator<'e> = DotPacking8QueryEvaluator<'e, u16, Scalar4BitValues>;
+pub type DotPacking8U16Scalar4BitQueryEvaluator<'e> =
+    DotPacking8QueryEvaluator<'e, u16, Scalar4BitValues>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::SquaredEuclideanDistance;
-    use crate::encoders::dotpacking8::values::ValueCodec;
-    use crate::{PackedSparseVectorEncoder, PlainSparseDataset};
     use crate::core::distances::Distance;
     use crate::core::vector::{PackedVectorView, SparseVectorView};
+    use crate::encoders::dotpacking8::values::ValueCodec;
     use crate::encoders::sparse_scalar::PlainSparseQuantizer;
     use crate::vector_encoder::SparseDataEncoder;
     use crate::{DatasetGrowable, PlainSparseDatasetGrowable, QueryEvaluator, VectorEncoder};
+    use crate::{PackedSparseVectorEncoder, PlainSparseDataset};
 
     /// Training data scaled so test inputs (values ~0.5..4) map to a spread of non-trivial
     /// 4-bit codes: per-component max is ~4, so `quants[c] ≈ 4/15 ≈ 0.27`.

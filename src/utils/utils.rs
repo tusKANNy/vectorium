@@ -4,8 +4,11 @@ use std::simd::Simd;
 
 use crate::{ComponentType, Dataset, PlainSparseDataset, ScalarSparseSupportedDistance, ValueType};
 
+/// Prefetch the first `max_bytes` of `data` (all of it if shorter), one cache line at a time.
+///
+/// The right `max_bytes` depends on the access pattern, so callers choose it.
 #[inline]
-pub fn prefetch_read_slice<T>(data: &[T]) {
+pub fn prefetch_read_slice<T>(data: &[T], max_bytes: usize) {
     let ptr = data.as_ptr() as *const u8;
 
     // Cache line size on x86 and most ARM CPUs is 64 bytes.
@@ -15,9 +18,7 @@ pub fn prefetch_read_slice<T>(data: &[T]) {
     let len = core::mem::size_of_val(data);
 
     // Looping with pointer arithmetic improves unrolling and avoids bounds checks.
-    // Prefetch at most 512 bytes: enough for the vectors and ranges read right after, without
-    // polluting the cache. 256 bytes slowed Seismic's posting-block scans by up to 24%.
-    let len_to_prefetch = len.min(512);
+    let len_to_prefetch = len.min(max_bytes);
     let mut i = 0;
     while i < len_to_prefetch {
         unsafe {
@@ -162,7 +163,12 @@ where
     C: ComponentType,
     D: ScalarSparseSupportedDistance,
 {
-    train_sparse_scalar_quantizer_with_levels(training_data, lower_percentile, upper_percentile, 255.0)
+    train_sparse_scalar_quantizer_with_levels(
+        training_data,
+        lower_percentile,
+        upper_percentile,
+        255.0,
+    )
 }
 
 /// Same as [`train_sparse_scalar_quantizer`] with `num_levels` quantization levels instead of
@@ -212,7 +218,10 @@ where
         (0.0..=1.0).contains(&upper_percentile) && upper_percentile > lower_percentile,
         "upper_percentile must be in (lower_percentile, 1.0], got {upper_percentile}"
     );
-    assert!(num_levels > 0.0, "num_levels must be positive, got {num_levels}");
+    assert!(
+        num_levels > 0.0,
+        "num_levels must be positive, got {num_levels}"
+    );
 
     // Fast path: classic min-max quantization. Sorting every per-component bucket
     // is wasteful when we only need the maximum, and on high-dim sparse datasets

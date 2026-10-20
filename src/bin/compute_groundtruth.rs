@@ -425,19 +425,39 @@ fn dispatch(args: Args) -> bool {
                 }
                 return match args.blocked_values.to_lowercase().as_str() {
                     "f16" => {
-                        compute_sparse_groundtruth_blocked::<vectorium::BlockF16Values>(input_path, query_path, output_path, k, l1_prune);
+                        compute_sparse_groundtruth_blocked::<vectorium::BlockF16Values>(
+                            input_path,
+                            query_path,
+                            output_path,
+                            k,
+                            l1_prune,
+                        );
                         true
                     }
                     "scalaru8" => {
-                        compute_sparse_groundtruth_blocked::<vectorium::BlockScalarU8Values>(input_path, query_path, output_path, k, l1_prune);
+                        compute_sparse_groundtruth_blocked::<vectorium::BlockScalarU8Values>(
+                            input_path,
+                            query_path,
+                            output_path,
+                            k,
+                            l1_prune,
+                        );
                         true
                     }
                     "scalaru16" => {
-                        compute_sparse_groundtruth_blocked::<vectorium::BlockScalarU16Values>(input_path, query_path, output_path, k, l1_prune);
+                        compute_sparse_groundtruth_blocked::<vectorium::BlockScalarU16Values>(
+                            input_path,
+                            query_path,
+                            output_path,
+                            k,
+                            l1_prune,
+                        );
                         true
                     }
                     other => {
-                        eprintln!("Unknown blocked values='{other}'. Use 'f16'|'scalaru8'|'scalaru16'.");
+                        eprintln!(
+                            "Unknown blocked values='{other}'. Use 'f16'|'scalaru8'|'scalaru16'."
+                        );
                         false
                     }
                 };
@@ -1190,7 +1210,6 @@ fn compute_sparse_groundtruth<C, V, D>(
     search_sparse_and_write(&dataset, &queries, output_path, k);
 }
 
-
 /// Prints dataset statistics, runs the exhaustive top-k search for every query (timed, with
 /// ms/query) and writes `query_id\tdoc_id\trank\tscore` lines.
 fn search_sparse_and_write<E, D>(
@@ -1258,6 +1277,7 @@ fn search_sparse_and_write<E, D>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_sparse_groundtruth_dotpacking8(
     input_path: String,
     query_path: String,
@@ -1269,10 +1289,9 @@ fn compute_sparse_groundtruth_dotpacking8(
     l1_prune: Option<f32>,
 ) -> bool {
     use vectorium::{
-        BridgedDotPacking8U32ScalarU16Encoder, BridgedDotPacking8U32ScalarU8Encoder,
-        DotPacking8U16F16Encoder, DotPacking8U16ScalarU16Encoder,
-        DotPacking8U16FixedU8Encoder, DotPacking8U16Scalar4BitEncoder,
-        DotPacking8U16ScalarU8Encoder,
+        BridgedDotPacking8U32ScalarU8Encoder, BridgedDotPacking8U32ScalarU16Encoder,
+        DotPacking8U16F16Encoder, DotPacking8U16FixedU8Encoder, DotPacking8U16Scalar4BitEncoder,
+        DotPacking8U16ScalarU8Encoder, DotPacking8U16ScalarU16Encoder,
     };
 
     // Value quantizers with per-component steps cannot skip training: their `train` both
@@ -1307,29 +1326,59 @@ fn compute_sparse_groundtruth_dotpacking8(
                     if train {
                         timed(TRAIN_LABEL, || encoder.train(&dataset_plain));
                     }
-                    run_packed_sparse_groundtruth(encoder, &dataset_plain, &queries, output_path, k);
+                    run_packed_sparse_groundtruth(
+                        encoder,
+                        &dataset_plain,
+                        &queries,
+                        output_path,
+                        k,
+                    );
                 }
                 "scalaru8" => {
                     let mut encoder = DotPacking8U16ScalarU8Encoder::new(dim);
                     timed(TRAIN_LABEL, || encoder.train(&dataset_plain));
-                    run_packed_sparse_groundtruth(encoder, &dataset_plain, &queries, output_path, k);
+                    run_packed_sparse_groundtruth(
+                        encoder,
+                        &dataset_plain,
+                        &queries,
+                        output_path,
+                        k,
+                    );
                 }
                 "f16" => {
                     let mut encoder = DotPacking8U16F16Encoder::new(dim);
                     if train {
                         timed(TRAIN_LABEL, || encoder.train(&dataset_plain));
                     }
-                    run_packed_sparse_groundtruth(encoder, &dataset_plain, &queries, output_path, k);
+                    run_packed_sparse_groundtruth(
+                        encoder,
+                        &dataset_plain,
+                        &queries,
+                        output_path,
+                        k,
+                    );
                 }
                 "scalaru16" => {
                     let mut encoder = DotPacking8U16ScalarU16Encoder::new(dim);
                     timed(TRAIN_LABEL, || encoder.train(&dataset_plain));
-                    run_packed_sparse_groundtruth(encoder, &dataset_plain, &queries, output_path, k);
+                    run_packed_sparse_groundtruth(
+                        encoder,
+                        &dataset_plain,
+                        &queries,
+                        output_path,
+                        k,
+                    );
                 }
                 "scalar4bit" => {
                     let mut encoder = DotPacking8U16Scalar4BitEncoder::new(dim);
                     timed(TRAIN_LABEL, || encoder.train(&dataset_plain));
-                    run_packed_sparse_groundtruth(encoder, &dataset_plain, &queries, output_path, k);
+                    run_packed_sparse_groundtruth(
+                        encoder,
+                        &dataset_plain,
+                        &queries,
+                        output_path,
+                        k,
+                    );
                 }
                 _ => {
                     eprintln!(
@@ -1395,7 +1444,10 @@ fn compute_sparse_groundtruth_blocked<V: vectorium::BlockValues>(
 
     let start = Instant::now();
     let dataset: PackedSparseDataset<BlockedSparseEncoder<V>> = dataset_plain.into();
-    println!("Encoding completed in {:.3}s", start.elapsed().as_secs_f64());
+    println!(
+        "Encoding completed in {:.3}s",
+        start.elapsed().as_secs_f64()
+    );
 
     search_packed_sparse_and_report(dataset, plain_bytes, nnz, &queries, output_path, k);
 }
@@ -1426,7 +1478,10 @@ fn run_packed_sparse_groundtruth<E>(
         growable.push(v);
     }
     let dataset: PackedSparseDataset<E> = growable.into();
-    println!("Encoding completed in {:.3}s", start.elapsed().as_secs_f64());
+    println!(
+        "Encoding completed in {:.3}s",
+        start.elapsed().as_secs_f64()
+    );
 
     search_packed_sparse_and_report(dataset, plain_bytes, nnz, queries, output_path, k);
 }

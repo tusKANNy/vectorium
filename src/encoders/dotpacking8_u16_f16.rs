@@ -8,13 +8,14 @@ pub type DotPacking8U16F16QueryEvaluator<'e> = DotPacking8QueryEvaluator<'e, u16
 mod tests {
     use super::*;
     use crate::PackedSparseVectorEncoder;
-    use half::f16;
     use crate::core::distances::Distance;
     use crate::core::vector::{PackedVectorView, SparseVectorView};
     use crate::vector_encoder::SparseDataEncoder;
     use crate::{
-        DatasetGrowable, PlainSparseDatasetGrowable, PlainSparseQuantizer, QueryEvaluator, VectorEncoder,
+        DatasetGrowable, PlainSparseDatasetGrowable, PlainSparseQuantizer, QueryEvaluator,
+        VectorEncoder,
     };
+    use half::f16;
 
     fn calculate_expected_distance(
         vector: &SparseVectorView<u16, f32>,
@@ -32,11 +33,11 @@ mod tests {
                 }
             }
 
-            if let Some(&(vec_comp, vec_val)) = vec_iter.peek() {
-                if vec_comp == comp {
-                    expected += f16::from_f32(vec_val).to_f32() * val;
-                    vec_iter.next();
-                }
+            if let Some(&(vec_comp, vec_val)) = vec_iter.peek()
+                && vec_comp == comp
+            {
+                expected += f16::from_f32(vec_val).to_f32() * val;
+                vec_iter.next();
             }
         }
         expected
@@ -169,11 +170,12 @@ mod tests {
         let input_components1 = [4, 8, 24];
         let input1 = SparseVectorView::new(&input_components1, &binding1);
 
-        let quantizer = PlainSparseQuantizer::<u16, f32, crate::SquaredEuclideanDistance>::new(100, 100);
+        let quantizer =
+            PlainSparseQuantizer::<u16, f32, crate::SquaredEuclideanDistance>::new(100, 100);
         let mut growable = PlainSparseDatasetGrowable::new(quantizer);
 
-        growable.push(input0.clone());
-        growable.push(input1.clone());
+        growable.push(input0);
+        growable.push(input1);
 
         encoder.train(&growable);
 
