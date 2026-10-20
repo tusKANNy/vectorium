@@ -6,9 +6,10 @@ Newest entries go at the top of each section.
 ## [0.10.0] - unreleased (branch `compression`)
 
 This branch (`compression`) started from `main` at `3fedb2f` (0.4.0) and has since merged
-`origin/main` up to 0.9.4 (`1ea428a`). The tables below list what `compression` adds or changes;
-the 0.5.0–0.9.4 changes themselves (RaBitQ, `l1_prune_split`, the `Config`/`QueryParams` encoder
-API, k-means and `RerankIndex` work, …) are in the git history of `origin/main`. Commit hashes
+`origin/main` up to its 0.10.0 (`5850880`). The tables below list what `compression` adds or changes;
+the 0.5.0–0.10.0 changes of `main` themselves (RaBitQ, `l1_prune_split`, the `Config`/`QueryParams`
+encoder API, generic dense/sparse k-means, `WithDistance`, `RerankIndex` moved to kANNolo, …) are in
+the git history of `origin/main`. Commit hashes
 below are on `compression`; "relative to `main`" means relative to 0.4.0 unless stated otherwise.
 
 Dependents: change the vectorium dependency to `0.10.0` (or the new git `rev`).

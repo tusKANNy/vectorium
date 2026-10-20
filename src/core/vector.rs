@@ -192,6 +192,12 @@ impl<V: ValueType> DenseVectorOwned<V> {
 }
 impl<V: ValueType> VectorView for DenseVectorOwned<V> {}
 
+impl<V: ValueType> AsMut<[V]> for DenseVectorOwned<V> {
+    fn as_mut(&mut self) -> &mut [V] {
+        &mut self.values
+    }
+}
+
 impl<'a, V: ValueType> From<&'a DenseVectorOwned<V>> for DenseVectorView<'a, V> {
     fn from(owned: &'a DenseVectorOwned<V>) -> Self {
         owned.as_view()
@@ -421,6 +427,13 @@ impl<C: ComponentType, V: ValueType> SparseVectorOwned<C, V> {
     }
 }
 impl<C: ComponentType, V: ValueType> VectorView for SparseVectorOwned<C, V> {}
+
+/// The values only: the components of a sparse vector are not mutable through this.
+impl<C: ComponentType, V: ValueType> AsMut<[V]> for SparseVectorOwned<C, V> {
+    fn as_mut(&mut self) -> &mut [V] {
+        &mut self.values
+    }
+}
 
 impl<'a, C: ComponentType, V: ValueType> From<&'a SparseVectorOwned<C, V>>
     for SparseVectorView<'a, C, V>

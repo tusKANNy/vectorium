@@ -22,7 +22,7 @@ half = { version = "2.6", features = [
     "num-traits",
 ] }
 ndarray = "0.16"
-ndarray-npy = {version="0.9", default-features = false}
+ndarray-npy = {version = "0.9", default-features = false}
 # TODO: use upstream when https://gitlab.com/tspiteri/fixed/-/issues/69 is fixed
 # If it's not getting fixed, prefer using a git patch when https://github.com/rust-lang/cargo/issues/4648 is fixed
 fixed = { git = "https://gitlab.com/tinozzo123/fixed", rev = "e7d72487b9da972d3ed7aec7bc32c12cd8881994", features = ["num-traits", "serde"] }
@@ -32,6 +32,7 @@ bytemuck = { version = "1.23", features = [
     "min_const_generics",
 ] }
 rusty-perm = "0.2.0"
+rgb = { package = "rgbisect", version = "0.1.0" }
 rand = "0.8"
 matrixmultiply = "0.3"
 faer = "0.19"

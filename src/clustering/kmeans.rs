@@ -1,11 +1,12 @@
-use crate::core::dataset::{DatasetGrowable, VectorId};
-use crate::core::distances::{Distance, SquaredEuclideanDistance, dot_product_dense};
+use crate::Dataset;
+use crate::core::dataset::{DatasetGrowable, MeanDataset};
+use crate::core::distances::{Distance, dot_product_dense};
 use crate::core::index::Index;
-use crate::core::vector::DenseVectorView;
-use crate::core::vector_encoder::{QueryEvaluator, VectorEncoder};
-use crate::datasets::dense_dataset::DenseDatasetGeneric;
-use crate::encoders::dense_scalar::ScalarDenseQuantizer;
-use crate::{Dataset, Float, FromF32, PlainDenseDataset, PlainDenseDatasetGrowable, ValueType};
+use crate::core::vector::{DenseVectorView, SparseVectorOwned, SparseVectorView};
+use crate::core::vector_encoder::{
+    QueryEvaluator, SparseDataEncoder, SparseVectorEncoder, VectorEncoder,
+};
+use crate::{ComponentType, VectorId};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -13,32 +14,31 @@ use rand::seq::index;
 use rayon::prelude::*;
 use std::time::Instant;
 
-/// Plain dense dataset over value type `V`, used for both training storage and
-/// centroids in [`KMeans::train_with_index`]. Means always accumulate in `f32`
-/// and queries are always `f32`; `T`/`C` only choose the stored layout.
+/// K-means over any [`MeanDataset`] (dense or sparse, any encoder).
 ///
-/// Precision guidance: `T = f16` halves the training-corpus footprint at equal
-/// clustering quality. For `C`, it depends on how the binary is compiled: with
-/// hardware f16 conversion enabled (e.g. `-C target-cpu=native` on x86 with
-/// F16C), an f16 index is both smaller and faster than f32 (distance kernels
-/// are memory-bound, and half the bytes means half the traffic); without those
-/// target features the f16 -> f32 conversion falls back to slow scalar code and
-/// an f16 index regresses badly, so portable builds should keep `C = f32`.
+/// The representation and the clustering metric are independent:
+/// - the **training dataset** `D` only has to be averageable ([`MeanDataset`]); its own metric is
+///   ignored;
+/// - the **centroids** are written into a growable dataset `G` whose encoder the caller passes, and
+///   that encoder fixes their storage precision;
+/// - the **clustering metric** is the distance of the centroid index `Q` used for assignment
+///   (e.g. a [`FlatIndex`](crate::FlatIndex) over `G`).
 ///
-/// # Range precondition on `C`
+/// Means always accumulate in `f32`, and assignment queries are the training vectors decoded to
+/// `f32`.
 ///
-/// Means are written into `C` via [`FromF32::from_f32_saturating`]. For IEEE
-/// half types that name is misleading: `f16`/`bf16` use `from_f32` rounding, so
-/// magnitudes above the type's finite max become `±inf` rather than clamping.
-/// With `T = f32` and `C = f16`, an unbounded training corpus can therefore
-/// produce `inf` centroids, an `inf` objective, and — because `best_obj` starts
-/// at `f32::MAX` — a silently empty return instead of a failure. Callers must
-/// ensure stored means stay in the finite range of `C` (or keep `C = f32`).
-/// The fixed-point types satisfy the bounds too, but `FixedU8`/`FixedU16` are
-/// *unsigned*: their `from_f32_saturating` really does clamp, yet every negative
-/// component clamps to `0`, so they silently destroy centred data as `T` or `C`.
-type Centroids<V> = PlainDenseDataset<V, SquaredEuclideanDistance>;
-
+/// # Precision of dense centroids
+///
+/// `T = f16` training storage halves the corpus footprint at equal clustering quality. For
+/// centroids stored as `C`, it depends on how the binary is compiled: with hardware f16
+/// conversion enabled (e.g. `-C target-cpu=native` on x86 with F16C), an f16 centroid index is
+/// both smaller and faster than f32; without it the f16 -> f32 conversion falls back to slow
+/// scalar code, so portable builds should keep `C = f32`.
+///
+/// Means are written into `C` via [`FromF32::from_f32_saturating`](crate::FromF32::from_f32_saturating). For `f16`/`bf16` that is IEEE
+/// `from_f32` rounding, so magnitudes above the type's finite max become `±inf` rather than
+/// clamping; callers must keep stored means inside the finite range of `C`. `FixedU8`/`FixedU16`
+/// are *unsigned*: every negative component clamps to `0`, so they destroy centred data.
 pub struct KMeans {
     n_iter: usize,
     n_redo: usize,
@@ -69,149 +69,158 @@ impl KMeans {
         unfairness_factor * k as f32 / (total * total)
     }
 
-    /// Assignment: for each vector, find nearest centroid by parallelizing over vectors
-    /// Internally decides whether to use HNSW index or flat search based on the number of centroids.
-    /// For small k (< index_threshold), uses flat dataset search. For large k, builds HNSW index.
-    pub fn compute_assignments<VIn, VOut>(
-        dataset: &DenseDatasetGeneric<
-            ScalarDenseQuantizer<VIn, VOut, SquaredEuclideanDistance>,
-            impl AsRef<[VOut]>,
-        >,
-        centroids: &DenseDatasetGeneric<
-            ScalarDenseQuantizer<VOut, VOut, SquaredEuclideanDistance>,
-            impl AsRef<[VOut]> + Sync,
-        >,
-        _index_threshold: usize,
-    ) -> Vec<(f32, usize)>
-    // sum of distances and assignments
+    /// Scale `values` to unit L2 norm in place; all-zero values stay zero.
+    fn normalize_l2(values: &mut [f32]) {
+        let norm: f32 = values.iter().map(|x| x * x).sum::<f32>().sqrt();
+        // Take inverse of norm, take 0 if norm is 0
+        let inv_norm = f32::from(norm > 0.0) * (1.0 / norm.max(f32::MIN_POSITIVE));
+        values.iter_mut().for_each(|x| *x *= inv_norm);
+    }
+
+    /// Store `means` in a fresh growable dataset with the given encoder.
+    fn to_dataset<M, G>(means: &[M], encoder: &G::Encoder) -> G
     where
-        VIn: Float + ValueType + FromF32,
-        VOut: Float + ValueType + FromF32,
+        G: DatasetGrowable,
+        for<'a> &'a M: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
     {
-        let centroid_encoder = centroids.encoder();
+        let mut centroids = G::with_capacity(encoder.clone(), means.len());
+        for mean in means {
+            centroids.push(mean.into());
+        }
+        centroids
+    }
 
-        dataset
-            .par_iter()
-            .map(|vector| {
-                let evaluator = centroid_encoder.vector_evaluator(vector);
-
-                centroids
-                    .iter()
-                    .enumerate()
-                    .map(|(ci, centroid_view)| {
-                        let distance = evaluator.compute_distance(centroid_view).distance();
-                        (distance, ci)
-                    })
-                    .min_by(|a, b| a.0.total_cmp(&b.0))
-                    .unwrap()
-            })
+    /// Run `assign` over the training vectors in parallel, with one decoded-query buffer per
+    /// rayon worker, overwritten per vector.
+    fn assign_each<D>(
+        dataset: &D,
+        assign: impl Fn(&D::Vector) -> (f32, usize) + Sync,
+    ) -> Vec<(f32, usize)>
+    where
+        D: MeanDataset + Sync,
+    {
+        (0..dataset.len() as u32)
+            .into_par_iter()
+            .map_init(
+                || None::<D::Vector>,
+                |buffer, i| {
+                    let query = match buffer {
+                        Some(query) => {
+                            dataset.vector_into(i, query);
+                            query
+                        }
+                        None => buffer.insert(dataset.vector(i)),
+                    };
+                    assign(query)
+                },
+            )
             .collect()
     }
 
-    fn renorm_l2(centroids: &mut [f32], d: usize) {
-        for sl in centroids.chunks_exact_mut(d) {
-            let norm: f32 = sl.iter().map(|x| x * x).sum::<f32>().sqrt();
-            // Take inverse of norm, take 0 if norm is 0
-            let inv_norm = f32::from(norm > 0.0) * (1.0 / norm.max(f32::MIN_POSITIVE));
-            sl.iter_mut().for_each(|x| *x *= inv_norm);
-        }
+    /// Flat assignment: for each vector, its nearest centroid by exhaustive scan of `centroids`
+    /// under the centroids' own metric.
+    ///
+    /// Returns `(distance, centroid)` per vector. Of tied centroids, the first wins.
+    pub fn compute_assignments<D, C>(dataset: &D, centroids: &C) -> Vec<(f32, usize)>
+    where
+        D: MeanDataset + Sync,
+        C: Dataset + Sync,
+        C::Encoder: VectorEncoder<QueryParams = ()>,
+        <C::Encoder as VectorEncoder>::Distance: Distance,
+        for<'a> &'a D::Vector: Into<<C::Encoder as VectorEncoder>::QueryVector<'a>>,
+    {
+        assert!(!centroids.is_empty(), "no centroids to assign to");
+        Self::assign_each(dataset, |query| {
+            let evaluator = centroids.encoder().query_evaluator(query.into(), &());
+            let best = centroids
+                .iter()
+                .enumerate()
+                .map(|(ci, centroid)| (evaluator.compute_distance(centroid), ci))
+                .reduce(|best, next| {
+                    if next.0.is_better_than(&best.0) {
+                        next
+                    } else {
+                        best
+                    }
+                })
+                .unwrap();
+            (best.0.distance(), best.1)
+        })
     }
 
-    /// Computes the centroids of the clustering as the mean of vectors assigned to each cluster.
-    /// Then, splits empty clusters
+    /// Assignment through an index: for each vector, its top-1 result in `index`, under the
+    /// index's metric.
     ///
-    /// # Arguments
+    /// Returns `(distance, centroid)` per vector.
+    pub fn assign_with_index<D, Q>(
+        dataset: &D,
+        index: &Q,
+        search_params: &Q::SearchParams,
+    ) -> Vec<(f32, usize)>
+    where
+        D: MeanDataset + Sync,
+        Q: Index + Sync,
+        Q::SearchParams: Sync,
+        for<'a> &'a D::Vector: Into<Q::Query<'a>>,
+    {
+        Self::assign_each(dataset, |query| {
+            let best = index
+                .search(query.into(), 1, search_params)
+                .into_iter()
+                .next()
+                .expect("centroid index returned no result during k-means assignment");
+            (best.distance.distance(), best.vector as usize)
+        })
+    }
+
+    /// Computes the centroids as the (weighted) means of the vectors assigned to each cluster,
+    /// passes each through `refine` together with its members, then splits empty clusters.
     ///
-    /// * `dataset`: the input dataset
-    /// * `weights`: the weight of each vector, optionally
-    /// * `k`: the number of clusters
-    /// * `assignments`: the latest assignment vector in the dataset - cluster
+    /// Returns the number of splits, the (weighted) size of each cluster and the new centroids.
     ///
-    /// returns: the number of splits, a vector storing how many vectors are assigned to each cluster and the new centroids in a Dataset.
-    ///
-    /// `VOut` is the training-vector storage type (read from `dataset`); `VCent`
-    /// is the centroid storage type written from the f32 means. They are usually
-    /// the same (`train`); [`train_with_index`] may choose `VCent = f32` while
-    /// training vectors stay `f16`.
-    fn update_and_split<VIn, VOut, VCent, Data>(
-        dataset: &DenseDatasetGeneric<
-            ScalarDenseQuantizer<VIn, VOut, SquaredEuclideanDistance>,
-            Data,
-        >,
+    /// Members are grouped by a stable counting sort, so each cluster averages its members in
+    /// ascending point order and the results are bit-identical across thread counts.
+    fn update_and_split<D>(
+        dataset: &D,
         weights: Option<&[f32]>,
         k: usize,
         assignments: &[(f32, usize)],
         rng: &mut StdRng,
         spherical: bool,
-    ) -> (
-        usize,
-        Vec<f32>,
-        PlainDenseDataset<VCent, SquaredEuclideanDistance>,
-    )
+        refine: &(impl Fn(&[u32], &mut D::Vector) + Sync),
+    ) -> (usize, Vec<f32>, Vec<D::Vector>)
     where
-        VIn: Float + ValueType + FromF32,
-        VOut: Float + ValueType + FromF32 + num_traits::ToPrimitive + num_traits::FromPrimitive,
-        VCent: Float + ValueType + FromF32 + num_traits::ToPrimitive + num_traits::FromPrimitive,
-        Data: AsRef<[VOut]> + Sync,
+        D: MeanDataset + Sync,
     {
         let n = dataset.len();
-        let d = dataset.output_dim();
 
-        // Counting-sort + cluster-parallel mean: two serial O(n) passes over the
-        // assignments (the histogram and the scatter) followed by a single parallel
-        // O(n*d) pass over the points.
-        // Scratch is one u32 per point (the grouping permutation) plus O(k) offsets
-        // — independent of thread count — instead of n_threads * k * d private
-        // accumulators. Clusters are processed in parallel into one shared (sums, counts)
-        // output; each cluster's members are visited in ascending point order from the
-        // stable counting sort, so the float summation order is fixed and results are
-        // bit-identical across thread counts.
-        let (centroids, histograms) = {
-            let mut cluster_sizes = vec![0usize; k];
-            for &(_, ci) in assignments {
-                cluster_sizes[ci] += 1;
-            }
+        let mut offsets = vec![0usize; k + 1];
+        for &(_, ci) in assignments {
+            offsets[ci + 1] += 1;
+        }
+        for c in 0..k {
+            offsets[c + 1] += offsets[c];
+        }
+        let mut grouped = vec![0u32; n];
+        let mut cursor = offsets.clone();
+        for (i, &(_, ci)) in assignments.iter().enumerate() {
+            grouped[cursor[ci]] = i as u32;
+            cursor[ci] += 1;
+        }
 
-            let mut offsets = vec![0usize; k + 1];
-            for c in 0..k {
-                offsets[c + 1] = offsets[c] + cluster_sizes[c];
-            }
-
-            let mut grouped = vec![0u32; n];
-            let mut cursor = offsets.clone();
-            for (i, &(_, ci)) in assignments.iter().enumerate().take(n) {
-                grouped[cursor[ci]] = i as u32;
-                cursor[ci] += 1;
-            }
-
-            let mut sums = vec![0.0f32; k * d];
-            let mut counts = vec![0.0f32; k];
-            sums.par_chunks_mut(d)
-                .zip(counts.par_iter_mut())
-                .enumerate()
-                .for_each(|(ci, (centroid, cnt))| {
-                    for &i in &grouped[offsets[ci]..offsets[ci + 1]] {
-                        let i = i as usize;
-                        let w = weights.map_or(1.0, |w| w[i]);
-                        *cnt += w;
-                        let vec = dataset.get(i as VectorId);
-                        for (c, x) in centroid.iter_mut().zip(vec.values().iter()) {
-                            *c += x.to_f32().unwrap() * w;
-                        }
-                    }
-                    if *cnt > 0.0 {
-                        let inv = 1.0 / *cnt;
-                        for x in centroid.iter_mut() {
-                            *x *= inv;
-                        }
-                    }
-                });
-
-            (sums, counts)
-        };
-
-        let mut centroids = centroids;
-        let mut histograms = histograms;
+        let (mut centroids, mut histograms): (Vec<D::Vector>, Vec<f32>) = (0..k)
+            .into_par_iter()
+            .map(|ci| {
+                let members = &grouped[offsets[ci]..offsets[ci + 1]];
+                let count = members
+                    .iter()
+                    .map(|&i| weights.map_or(1.0, |w| w[i as usize]))
+                    .sum::<f32>();
+                let mut centroid = dataset.mean(members, weights);
+                refine(members, &mut centroid);
+                (centroid, count)
+            })
+            .unzip();
 
         // Splits clusters
         let mut n_splits = 0;
@@ -232,16 +241,14 @@ impl KMeans {
                 cj = (cj + 1) % k;
             }
 
-            let tmp = centroids[cj * d..(cj + 1) * d].to_owned();
-            centroids[ci * d..(ci + 1) * d].copy_from_slice(&tmp);
-
-            for j in 0..d {
+            centroids[ci] = centroids[cj].clone();
+            for j in 0..centroids[ci].as_mut().len() {
                 if j % 2 == 0 {
-                    centroids[ci * d + j] *= 1.0 + epsilon;
-                    centroids[cj * d + j] *= 1.0 - epsilon;
+                    centroids[ci].as_mut()[j] *= 1.0 + epsilon;
+                    centroids[cj].as_mut()[j] *= 1.0 - epsilon;
                 } else {
-                    centroids[ci * d + j] *= 1.0 - epsilon;
-                    centroids[cj * d + j] *= 1.0 + epsilon;
+                    centroids[ci].as_mut()[j] *= 1.0 - epsilon;
+                    centroids[cj].as_mut()[j] *= 1.0 + epsilon;
                 }
             }
 
@@ -251,270 +258,175 @@ impl KMeans {
         }
 
         if spherical {
-            Self::renorm_l2(&mut centroids, d);
+            for centroid in centroids.iter_mut() {
+                Self::normalize_l2(centroid.as_mut());
+            }
         }
 
-        // Convert f32 means into the caller-chosen centroid storage type.
-        let centroids_out: Vec<VCent> = centroids
-            .iter()
-            .map(|&x| VCent::from_f32_saturating(x))
-            .collect();
+        (n_splits, histograms, centroids)
+    }
 
-        (
-            n_splits,
-            histograms,
-            PlainDenseDataset::<VCent, SquaredEuclideanDistance>::from_raw(
-                centroids_out.into_boxed_slice(),
-                k,
-                ScalarDenseQuantizer::new(dataset.encoder().output_dim()),
-            ),
+    /// Runs k-means with `k` clusters on any [`MeanDataset`], with flat (exhaustive) assignment.
+    ///
+    /// Centroids are stored in a growable dataset `G` built with `centroid_encoder`, which fixes
+    /// both their storage precision and the **clustering metric**: every training vector is
+    /// assigned to its nearest centroid under `G`'s metric (see [`KMeans`]). With `weights`,
+    /// centroids are weighted means.
+    ///
+    /// The objective is the sum of the assignment distances, compared through the metric's
+    /// [`Distance`] ordering (minimized for squared Euclidean, maximized for dot product). The
+    /// centroids of the best iteration are returned. With a fixed [`KMeansBuilder::seed`] the
+    /// result is deterministic across runs and thread counts.
+    pub fn train<D, G>(
+        &self,
+        training_dataset: &D,
+        k: usize,
+        weights: Option<Vec<f32>>,
+        centroid_encoder: G::Encoder,
+    ) -> G
+    where
+        D: MeanDataset + Sync,
+        G: DatasetGrowable + Clone + Sync,
+        G::Encoder: VectorEncoder<QueryParams = ()>,
+        <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>
+            + Into<<G::Encoder as VectorEncoder>::QueryVector<'a>>,
+    {
+        self.train_refined(training_dataset, k, weights, centroid_encoder, |_, _| {})
+    }
+
+    /// Like [`train`](Self::train), but every centroid update is followed by
+    /// `refine(members, &mut centroid)`, where `members` are the ids of the training vectors
+    /// assigned to that centroid. The refined centroid is the one used from then on: for the next
+    /// assignment, for splitting empty clusters, and as the result.
+    ///
+    /// This is how a representation-specific policy enters the generic loop, e.g. pruning sparse
+    /// centroids to their largest components while k-means runs.
+    pub fn train_refined<D, G>(
+        &self,
+        training_dataset: &D,
+        k: usize,
+        weights: Option<Vec<f32>>,
+        centroid_encoder: G::Encoder,
+        refine: impl Fn(&[u32], &mut D::Vector) + Sync,
+    ) -> G
+    where
+        D: MeanDataset + Sync,
+        G: DatasetGrowable + Clone + Sync,
+        G::Encoder: VectorEncoder<QueryParams = ()>,
+        <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>
+            + Into<<G::Encoder as VectorEncoder>::QueryVector<'a>>,
+    {
+        self.fit::<D, G, <G::Encoder as VectorEncoder>::Distance>(
+            training_dataset,
+            k,
+            weights,
+            centroid_encoder,
+            |centroids| Self::compute_assignments(training_dataset, centroids),
+            refine,
         )
     }
 
-    /// Cast a dense vector from storage type `T` to centroid type `C` via f32.
-    #[inline]
-    fn cast_dense_values<T, C>(values: &[T]) -> Vec<C>
-    where
-        T: ValueType + num_traits::ToPrimitive,
-        C: FromF32,
-    {
-        values
-            .iter()
-            .map(|x| {
-                C::from_f32_saturating(x.to_f32().expect("value type is not representable as f32"))
-            })
-            .collect()
-    }
-
-    /// Runs K-Means training on a dataset with k clusters.
-    /// If the user has provided input weights, the computation of centroids is the weighted mean
-    /// of every vector assigned to their cluster. Otherwise the computation is just the mean.
-    ///
-    /// If a sample_size is specified, a random sample of that size is used for training.
-    /// Otherwise, the full dataset is used for training.
-    ///
-    /// # Arguments
-    ///
-    /// * `dataset`: the dataset (can be f32 or f16)
-    /// * `k`: the desired number of clusters
-    /// * `weights`: optionally weights of the same length of the dataset
-    ///
-    /// returns: the best computed centroids in the training.
-    ///
-    pub fn train<VIn, VOut, Data>(
-        &self,
-        training_dataset: &DenseDatasetGeneric<
-            ScalarDenseQuantizer<VIn, VOut, SquaredEuclideanDistance>,
-            Data,
-        >,
-        k: usize,
-        weights: Option<Vec<f32>>,
-    ) -> PlainDenseDataset<VOut, SquaredEuclideanDistance>
-    where
-        VIn: Float + ValueType + FromF32,
-        VOut: Float
-            + ValueType
-            + FromF32
-            + num_traits::ToPrimitive
-            + num_traits::FromPrimitive
-            + Clone,
-        Data: AsRef<[VOut]> + Sync,
-    {
-        let n = training_dataset.len();
-
-        if n == k {
-            if self.verbose {
-                println!("WARNING: number of training data is equal to the number of clusters.");
-            }
-            // Convert generic dataset to PlainDenseDataset for return
-            return PlainDenseDataset::<VOut, SquaredEuclideanDistance>::from_raw(
-                training_dataset.values().to_vec().into_boxed_slice(),
-                n,
-                ScalarDenseQuantizer::new(training_dataset.encoder().output_dim()),
-            );
-        }
-
-        let d = training_dataset.output_dim();
-
-        if self.verbose {
-            println!(
-                "Clustering {} points in {}D to {} clusters, redo {} times, {} iterations",
-                n, d, k, self.n_redo, self.n_iter
-            );
-        }
-
-        let mut best_obj = f32::MAX;
-
-        // clustering-related
-        let output_dim = training_dataset.output_dim();
-        let mut best_centroids = PlainDenseDataset::<VOut, SquaredEuclideanDistance>::from_raw(
-            Vec::new().into_boxed_slice(),
-            0,
-            ScalarDenseQuantizer::new(output_dim),
-        );
-
-        let w = weights.as_deref();
-
-        // RNG used only for empty-cluster splitting.
-        let mut rng = match self.seed {
-            Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_entropy(),
-        };
-
-        for redo in 0..self.n_redo {
-            let mut centroids_builder =
-                PlainDenseDatasetGrowable::with_capacity(ScalarDenseQuantizer::new(output_dim), k);
-
-            // Offset by `redo` so each restart draws a different initial sample
-            // (a fixed `s + 1` would make every redo identical under a fixed seed).
-            let mut init_rng = match self.seed {
-                Some(s) => StdRng::seed_from_u64(s + 1 + redo as u64),
-                None => StdRng::from_entropy(),
-            };
-            for i in index::sample(&mut init_rng, n, k).into_iter() {
-                let vector = training_dataset.get(i as VectorId);
-                centroids_builder.push(vector);
-            }
-
-            let mut centroids: PlainDenseDataset<VOut, SquaredEuclideanDistance> =
-                centroids_builder.into();
-
-            let mut obj;
-            let mut average_imbalance_factor = 0.0;
-            let mut total_splits = 0;
-
-            for i in 0..self.n_iter {
-                let t0 = Instant::now();
-
-                // Assignment: find nearest centroid for each vector
-                let assignments = Self::compute_assignments(training_dataset, &centroids, 0);
-
-                let search_time = t0.elapsed();
-                let t0 = Instant::now();
-                obj = assignments.iter().map(|&(value, _)| value).sum();
-
-                // Update: recompute centroids
-                let (n_split, histograms, new_centroids) = Self::update_and_split(
-                    training_dataset,
-                    w,
-                    k,
-                    &assignments,
-                    &mut rng,
-                    self.spherical,
-                );
-
-                let imbalance_factor = Self::imbalance_factor(&histograms, k);
-                let split_time = t0.elapsed();
-
-                average_imbalance_factor += imbalance_factor;
-                total_splits += n_split;
-
-                if obj < best_obj {
-                    if self.verbose {
-                        println!("New best objective: {} (keep new clusters)", obj);
-                    }
-                    best_obj = obj;
-                    best_centroids = new_centroids.clone();
-                }
-
-                centroids = new_centroids;
-
-                if self.verbose {
-                    println!(
-                        "Iteration {}, imbalance: {}, splits: {}, search time: {:.2?} split time: {:.2?} ",
-                        i, imbalance_factor, n_split, search_time, split_time
-                    );
-                }
-            }
-
-            if self.verbose {
-                println!(
-                    "Outer iteration {} -- average imbalance: {}, splits: {}",
-                    redo,
-                    average_imbalance_factor / (self.n_iter + 1) as f32,
-                    total_splits
-                );
-            }
-        }
-        best_centroids
-    }
-
-    /// Like [`train`], but uses a generic [`Index`] for centroid assignment instead of exhaustive
-    /// flat search. At each k-means iteration the index is rebuilt from the current centroids and
-    /// then searched (top-1) for every training vector.
-    ///
-    /// # Type parameters
-    /// * `T` — storage precision of the **training** vectors (e.g. `f16` to halve the corpus).
-    /// * `C` — storage precision of the **centroids** and of the dataset the index is built on
-    ///   (`f32` is the safe portable default; `f16` is faster and smaller when the binary is
-    ///   built with hardware f16 conversion, e.g. `-C target-cpu=native` — see [`Centroids`]).
-    /// * `Q` — centroid index type; must accept `f32` queries.
-    ///
-    /// Means still accumulate in `f32` inside [`update_and_split`]. Training vectors of type `T`
-    /// are upconverted to `f32` per query in [`assign_with_index`]. `T = C = f32` is the IVF /
-    /// kannolo call shape (turbofish `train_with_index::<HNSW<..>, f32, f32>` or let `T`/`C`
-    /// infer from the dataset and closure).
-    ///
-    /// This is a breaking change vs the previous single-generic `train_with_index::<Q>`: callers
-    /// must supply or infer `T` and `C`.
-    ///
-    /// # Range precondition on `C`
-    ///
-    /// Means are cast into `C` with [`FromF32::from_f32_saturating`]. For `f16`/`bf16` that
-    /// method does **not** clamp: it is IEEE `from_f32`, so values outside the finite range
-    /// become `±inf`. With `T = f32` and `C = f16`, an unbounded training corpus can therefore
-    /// produce `inf` centroids and an `inf` objective; because `best_obj` starts at `f32::MAX`
-    /// and `inf < f32::MAX` is false, this method then returns an **empty** centroid set instead
-    /// of failing. Callers must keep stored means inside the finite range of `C`, or use
-    /// `C = f32`.
-    ///
-    /// The fixed-point scalar types satisfy `T`/`C`'s bounds as well, and for them
-    /// `from_f32_saturating` really does clamp — but `FixedU8`/`FixedU16` are *unsigned*,
-    /// so every negative component clamps to `0`. Centred data must not be stored in them.
+    /// Like [`train`](Self::train), but assigns through an [`Index`]: at each iteration
+    /// `build_centroid_index` builds an index over the current centroids and every training
+    /// vector takes its top-1 result there. The index's metric is the clustering metric.
     ///
     /// **Reproducibility caveat:** with a fixed [`KMeansBuilder::seed`], initialization and the
     /// update step are deterministic, but end-to-end reproducibility additionally requires the
-    /// index produced by `build_centroid_index` to be deterministic in build and search. A
-    /// parallel HNSW build generally is not, so assignments (and thus centroids) may still vary
-    /// run to run. [`train`] (flat assignment) does not have this caveat.
-    pub fn train_with_index<Q, T, C>(
+    /// index to be deterministic in build and search. A parallel HNSW build generally is not.
+    pub fn train_with_index<D, G, Q>(
         &self,
-        training_dataset: &Centroids<T>,
+        training_dataset: &D,
         k: usize,
         weights: Option<Vec<f32>>,
-        build_centroid_index: impl Fn(Centroids<C>) -> Q,
+        centroid_encoder: G::Encoder,
+        build_centroid_index: impl Fn(G) -> Q,
         search_params: &Q::SearchParams,
-    ) -> Centroids<C>
+    ) -> G
     where
-        T: Float
-            + ValueType
-            + FromF32
-            + num_traits::ToPrimitive
-            + num_traits::FromPrimitive
-            + Clone,
-        C: Float
-            + ValueType
-            + FromF32
-            + num_traits::ToPrimitive
-            + num_traits::FromPrimitive
-            + Clone,
+        D: MeanDataset + Sync,
+        G: DatasetGrowable + Clone,
+        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
         Q: Index + Sync,
-        for<'q> Q: Index<Query<'q> = DenseVectorView<'q, f32>>,
         Q::SearchParams: Sync,
+        Q::Distance: From<f32>,
+        for<'a> &'a D::Vector: Into<Q::Query<'a>>,
+    {
+        self.train_with_index_refined(
+            training_dataset,
+            k,
+            weights,
+            centroid_encoder,
+            build_centroid_index,
+            search_params,
+            |_, _| {},
+        )
+    }
+
+    /// Like [`train_with_index`](Self::train_with_index), but every centroid update is followed
+    /// by `refine(members, &mut centroid)`, as in [`train_refined`](Self::train_refined).
+    #[allow(clippy::too_many_arguments)]
+    pub fn train_with_index_refined<D, G, Q>(
+        &self,
+        training_dataset: &D,
+        k: usize,
+        weights: Option<Vec<f32>>,
+        centroid_encoder: G::Encoder,
+        build_centroid_index: impl Fn(G) -> Q,
+        search_params: &Q::SearchParams,
+        refine: impl Fn(&[u32], &mut D::Vector) + Sync,
+    ) -> G
+    where
+        D: MeanDataset + Sync,
+        G: DatasetGrowable + Clone,
+        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
+        Q: Index + Sync,
+        Q::SearchParams: Sync,
+        Q::Distance: From<f32>,
+        for<'a> &'a D::Vector: Into<Q::Query<'a>>,
+    {
+        self.fit::<D, G, Q::Distance>(
+            training_dataset,
+            k,
+            weights,
+            centroid_encoder,
+            |centroids| {
+                let index = build_centroid_index(centroids.clone());
+                Self::assign_with_index(training_dataset, &index, search_params)
+            },
+            refine,
+        )
+    }
+
+    /// The k-means loop shared by [`train_refined`](Self::train_refined) and
+    /// [`train_with_index_refined`](Self::train_with_index_refined). `assign` maps the current centroids to one
+    /// `(distance, centroid)` per training vector, under metric `M`; `refine` is applied to every
+    /// updated centroid.
+    fn fit<D, G, M>(
+        &self,
+        training_dataset: &D,
+        k: usize,
+        weights: Option<Vec<f32>>,
+        centroid_encoder: G::Encoder,
+        assign: impl Fn(&G) -> Vec<(f32, usize)>,
+        refine: impl Fn(&[u32], &mut D::Vector) + Sync,
+    ) -> G
+    where
+        D: MeanDataset + Sync,
+        G: DatasetGrowable + Clone,
+        M: Distance + From<f32>,
+        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
     {
         let n = training_dataset.len();
-        let d = training_dataset.output_dim();
+        let single = |i: usize| training_dataset.vector(i as u32);
 
         if n == k {
             if self.verbose {
                 println!("WARNING: number of training data is equal to the number of clusters.");
             }
-            let cast = Self::cast_dense_values::<T, C>(training_dataset.values());
-            return Centroids::<C>::from_raw(
-                cast.into_boxed_slice(),
-                n,
-                ScalarDenseQuantizer::new(d),
-            );
+            let means: Vec<D::Vector> = (0..n).map(single).collect();
+            return Self::to_dataset(&means, &centroid_encoder);
         }
         assert!(
             k < n,
@@ -523,76 +435,72 @@ impl KMeans {
 
         if self.verbose {
             println!(
-                "Clustering {} points in {}D to {} clusters (ANN assignment), redo {} times, {} iterations",
-                n, d, k, self.n_redo, self.n_iter
+                "Clustering {} points ({} nnz, dim {}) to {} clusters, redo {} times, {} iterations",
+                n,
+                training_dataset.nnz(),
+                training_dataset.input_dim(),
+                k,
+                self.n_redo,
+                self.n_iter
             );
         }
 
-        let mut best_obj = f32::MAX;
-        let mut best_centroids = Centroids::<C>::from_raw(
-            Vec::new().into_boxed_slice(),
-            0,
-            ScalarDenseQuantizer::new(d),
-        );
+        let mut best_obj: Option<M> = None;
+        let mut best_centroids = G::new(centroid_encoder.clone());
 
         let w = weights.as_deref();
+        // RNG used only for empty-cluster splitting.
         let mut rng = match self.seed {
             Some(s) => StdRng::seed_from_u64(s),
             None => StdRng::from_entropy(),
         };
 
         for redo in 0..self.n_redo {
-            let mut centroids_builder: PlainDenseDatasetGrowable<C, SquaredEuclideanDistance> =
-                PlainDenseDatasetGrowable::with_capacity(ScalarDenseQuantizer::new(d), k);
             // Offset by `redo` so each restart draws a different initial sample
             // (a fixed `s + 1` would make every redo identical under a fixed seed).
             let mut init_rng = match self.seed {
                 Some(s) => StdRng::seed_from_u64(s + 1 + redo as u64),
                 None => StdRng::from_entropy(),
             };
-            for i in index::sample(&mut init_rng, n, k).into_iter() {
-                let src = training_dataset.get(i as VectorId);
-                let cast = Self::cast_dense_values::<T, C>(src.values());
-                centroids_builder.push(DenseVectorView::new(&cast));
-            }
-            let mut centroids: Centroids<C> = centroids_builder.into();
+            let init: Vec<D::Vector> = index::sample(&mut init_rng, n, k)
+                .into_iter()
+                .map(single)
+                .collect();
+            let mut centroids: G = Self::to_dataset(&init, &centroid_encoder);
 
-            let mut obj;
             let mut average_imbalance_factor = 0.0;
             let mut total_splits = 0;
 
             for i in 0..self.n_iter {
                 let t0 = Instant::now();
-                let centroid_index = build_centroid_index(centroids.clone());
-                let build_idx_time = t0.elapsed();
+                let assignments = assign(&centroids);
+                let assign_time = t0.elapsed();
 
                 let t0 = Instant::now();
-                let assignments =
-                    Self::assign_with_index(training_dataset, &centroid_index, search_params);
-                let search_time = t0.elapsed();
+                let obj: f32 = assignments.iter().map(|&(v, _)| v).sum();
 
-                let t0 = Instant::now();
-                obj = assignments.iter().map(|&(v, _)| v).sum();
-
-                let (n_split, histograms, new_centroids) = Self::update_and_split::<_, _, C, _>(
+                let (n_split, histograms, means) = Self::update_and_split(
                     training_dataset,
                     w,
                     k,
                     &assignments,
                     &mut rng,
                     self.spherical,
+                    &refine,
                 );
+                let new_centroids: G = Self::to_dataset(&means, &centroid_encoder);
                 let imbalance_factor = Self::imbalance_factor(&histograms, k);
                 let split_time = t0.elapsed();
 
                 average_imbalance_factor += imbalance_factor;
                 total_splits += n_split;
 
-                if obj < best_obj {
+                let obj = M::from(obj);
+                if best_obj.is_none_or(|best| obj < best) {
                     if self.verbose {
-                        println!("New best objective: {obj} (keep new clusters)");
+                        println!("New best objective: {} (keep new clusters)", obj.distance());
                     }
-                    best_obj = obj;
+                    best_obj = Some(obj);
                     best_centroids = new_centroids.clone();
                 }
                 centroids = new_centroids;
@@ -600,7 +508,8 @@ impl KMeans {
                 if self.verbose {
                     println!(
                         "Iteration {i}, imbalance: {imbalance_factor:.4}, splits: {n_split}, \
-                         build_idx: {build_idx_time:.2?}, search: {search_time:.2?}, split: {split_time:.2?}"
+                         centroid nnz: {}, assign: {assign_time:.2?}, split: {split_time:.2?}",
+                        centroids.nnz()
                     );
                 }
             }
@@ -614,56 +523,6 @@ impl KMeans {
         }
 
         best_centroids
-    }
-
-    /// Assigns each vector in `dataset` to its nearest centroid using `index` (top-1 search).
-    ///
-    /// The dataset stores vectors in precision `T`; the centroid index is searched with `f32`
-    /// queries, so each stored vector is upconverted to `f32` before the search. The scratch
-    /// buffer is reused per rayon worker (via `map_init`) rather than allocated per query, so the
-    /// `T = f32` path costs one `dim`-length copy per query instead of the previous zero-copy view
-    /// — negligible next to a single HNSW search, and it keeps the hot loop allocation-free.
-    pub fn assign_with_index<Q, T>(
-        dataset: &Centroids<T>,
-        index: &Q,
-        search_params: &Q::SearchParams,
-    ) -> Vec<(f32, usize)>
-    where
-        T: Float
-            + ValueType
-            + FromF32
-            + num_traits::ToPrimitive
-            + num_traits::FromPrimitive
-            + Clone,
-        Q: Index + Sync,
-        for<'q> Q: Index<Query<'q> = DenseVectorView<'q, f32>>,
-        Q::SearchParams: Sync,
-    {
-        let values = dataset.values();
-        let dim = dataset.output_dim();
-        let n = dataset.len();
-
-        (0..n)
-            .into_par_iter()
-            .map_init(
-                || Vec::<f32>::with_capacity(dim),
-                |query_buf, i| {
-                    query_buf.clear();
-                    query_buf.extend(
-                        values[i * dim..(i + 1) * dim]
-                            .iter()
-                            .map(|x| x.to_f32().expect("value type is not representable as f32")),
-                    );
-                    let query = DenseVectorView::new(query_buf.as_slice());
-                    let results = index.search(query, 1, search_params);
-                    let best = results
-                        .into_iter()
-                        .next()
-                        .expect("centroid index returned no result during k-means assignment");
-                    (best.distance.distance(), best.vector as usize)
-                },
-            )
-            .collect()
     }
 }
 
@@ -749,14 +608,77 @@ impl KMeansBuilder {
     }
 }
 
+/// A `refine` for [`KMeans::train_refined`] / [`KMeans::train_with_index_refined`] on sparse
+/// data: prune each centroid to its `⌈factor · a⌉` largest-magnitude components, where `a` is
+/// the average nnz of the vectors of `dataset` assigned to it.
+///
+/// Exact sparse means are much denser than the vectors they average, which makes both
+/// assignment and any later scan over the centroids expensive. Pruning during training keeps
+/// each centroid consistent with the assignment it drives, and makes every iteration cheaper.
+/// Empty clusters are left unpruned. `dataset` must be the training dataset (member IDs index
+/// it).
+pub fn sparse_centroid_pruning<D>(
+    dataset: &D,
+    factor: f32,
+) -> impl Fn(&[u32], &mut SparseVectorOwned<<D::Encoder as SparseDataEncoder>::InputComponentType, f32>)
++ Sync
++ '_
+where
+    D: Dataset + Sync,
+    D::Encoder: SparseVectorEncoder,
+{
+    move |members, centroid| {
+        if members.is_empty() {
+            return;
+        }
+        let total: usize = members
+            .iter()
+            .map(|&i| dataset.get(i as VectorId).len())
+            .sum();
+        let keep = (factor * total as f32 / members.len() as f32).ceil() as usize;
+        *centroid = top_components(centroid.as_view(), keep);
+    }
+}
+
+/// The `keep` largest-magnitude components of `vector`, in component order.
+fn top_components<C: ComponentType>(
+    vector: SparseVectorView<'_, C, f32>,
+    keep: usize,
+) -> SparseVectorOwned<C, f32> {
+    let mut top: Vec<usize> = (0..vector.len()).collect();
+    if keep < top.len() {
+        top.select_nth_unstable_by(keep, |&a, &b| {
+            vector.values()[b]
+                .abs()
+                .total_cmp(&vector.values()[a].abs())
+        });
+        top.truncate(keep);
+        top.sort_unstable();
+    }
+    SparseVectorOwned::new(
+        top.iter().map(|&j| vector.components()[j]).collect(),
+        top.iter().map(|&j| vector.values()[j]).collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::flat_index::FlatIndex;
     use crate::core::vector::DenseVectorView;
+    use crate::core::vector::SparseVectorView;
+    use crate::datasets::dense_dataset::DenseDatasetGrowable;
+    use crate::distances::DotProduct;
     use crate::distances::SquaredEuclideanDistance;
-    use crate::encoders::dense_scalar::PlainDenseQuantizer;
-    use crate::{PlainDenseDataset, PlainDenseDatasetGrowable};
+    use crate::encoders::dense_scalar::{PlainDenseQuantizer, ScalarDenseQuantizer};
+    use crate::encoders::sparse_scalar::PlainSparseQuantizer;
+    use crate::{Float, FromF32, ValueType};
+    use crate::{
+        PlainDenseDataset, PlainDenseDatasetGrowable, PlainSparseDataset,
+        PlainSparseDatasetGrowable,
+    };
+
+    type Centroids<V> = PlainDenseDataset<V, SquaredEuclideanDistance>;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
 
@@ -777,7 +699,7 @@ mod tests {
             encoder.clone(),
         );
         let assignments: Vec<(f32, usize)> =
-            KMeans::compute_assignments(&dataset, &centroids_dataset, 0)
+            KMeans::compute_assignments(&dataset, &centroids_dataset)
                 .into_iter()
                 .collect();
 
@@ -797,10 +719,11 @@ mod tests {
 
         let dataset: PlainDenseDataset<f32, SquaredEuclideanDistance> = dataset_builder.into();
         let kmeans = KMeansBuilder::new().n_iter(5).n_redo(2).build();
-        let centroids = kmeans.train(&dataset, 2, None);
+        let centroids: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> =
+            kmeans.train(&dataset, 2, None, PlainDenseQuantizer::new(2));
 
         assert_eq!(centroids.len(), 2);
-        let assignments = KMeans::compute_assignments(&dataset, &centroids, 0);
+        let assignments = KMeans::compute_assignments(&dataset, &centroids);
         let assignments: Vec<(f32, usize)> = assignments.into_iter().collect();
         let cluster_ids: std::collections::HashSet<usize> =
             assignments.iter().map(|&(_, idx)| idx).collect();
@@ -854,10 +777,13 @@ mod tests {
             .n_redo(3)
             .seed(Some(42))
             .build();
-        let centroids = kmeans.train_with_index::<FlatIndex<Centroids<C>>, T, C>(
+        let centroids: DenseDatasetGrowable<
+            ScalarDenseQuantizer<f32, C, SquaredEuclideanDistance>,
+        > = kmeans.train_with_index(
             &dataset,
             2,
             None,
+            ScalarDenseQuantizer::new(2),
             FlatIndex::from,
             &(),
         );
@@ -950,14 +876,21 @@ mod tests {
             (0.0, 1),
         ];
         let mut rng = StdRng::seed_from_u64(0);
-        let (n_splits, hist, centroids): (_, _, Centroids<f32>) =
-            KMeans::update_and_split(&dataset, None, 2, &assignments, &mut rng, false);
+        let (n_splits, hist, centroids) = KMeans::update_and_split(
+            &dataset,
+            None,
+            2,
+            &assignments,
+            &mut rng,
+            false,
+            &|_: &[u32], _: &mut _| {},
+        );
 
         assert_eq!(n_splits, 0, "no empty clusters => no splits");
         assert_eq!(hist, vec![3.0, 3.0]);
 
-        let c0 = centroids.get(0 as VectorId).values().to_vec();
-        let c1 = centroids.get(1 as VectorId).values().to_vec();
+        let c0 = centroids[0].values().to_vec();
+        let c1 = centroids[1].values().to_vec();
         for (a, b) in c0.iter().zip([1.0f32, 1.0].iter()) {
             assert!((a - b).abs() < 1e-5, "cluster 0 mean {a} != {b}");
         }
@@ -978,8 +911,15 @@ mod tests {
         let dataset: PlainDenseDataset<f32, SquaredEuclideanDistance> = builder.into();
         let assignments = vec![(0.0, 0usize), (0.0, 0), (0.0, 1), (0.0, 1)];
         let mut rng = StdRng::seed_from_u64(0);
-        let (n_splits, _hist, centroids): (_, _, Centroids<f32>) =
-            KMeans::update_and_split(&dataset, None, 3, &assignments, &mut rng, false);
+        let (n_splits, _hist, centroids) = KMeans::update_and_split(
+            &dataset,
+            None,
+            3,
+            &assignments,
+            &mut rng,
+            false,
+            &|_: &[u32], _: &mut _| {},
+        );
         assert_eq!(n_splits, 1, "one empty cluster => one split");
         assert_eq!(centroids.len(), 3);
     }
@@ -1012,12 +952,18 @@ mod tests {
                 .unwrap()
                 .install(|| {
                     let mut rng = StdRng::seed_from_u64(0);
-                    let (_, _, centroids): (_, _, Centroids<f32>) =
-                        KMeans::update_and_split(&dataset, None, k, &assignments, &mut rng, false);
+                    let (_, _, centroids) = KMeans::update_and_split(
+                        &dataset,
+                        None,
+                        k,
+                        &assignments,
+                        &mut rng,
+                        false,
+                        &|_: &[u32], _: &mut _| {},
+                    );
                     (0..k)
                         .flat_map(|ci| {
-                            centroids
-                                .get(ci as VectorId)
+                            centroids[ci]
                                 .values()
                                 .iter()
                                 .map(|x| x.to_bits())
@@ -1048,18 +994,352 @@ mod tests {
         let weights = [1.0f32, 3.0, 2.0, 2.0];
         let assignments = vec![(0.0, 0usize), (0.0, 0), (0.0, 1), (0.0, 1)];
         let mut rng = StdRng::seed_from_u64(0);
-        let (n_splits, hist, centroids): (_, _, Centroids<f32>) =
-            KMeans::update_and_split(&dataset, Some(&weights), 2, &assignments, &mut rng, false);
+        let (n_splits, hist, centroids) = KMeans::update_and_split(
+            &dataset,
+            Some(&weights),
+            2,
+            &assignments,
+            &mut rng,
+            false,
+            &|_: &[u32], _: &mut _| {},
+        );
 
         assert_eq!(n_splits, 0);
         assert_eq!(hist, vec![4.0, 4.0]);
-        let c0 = centroids.get(0 as VectorId).values().to_vec();
-        let c1 = centroids.get(1 as VectorId).values().to_vec();
+        let c0 = centroids[0].values().to_vec();
+        let c1 = centroids[1].values().to_vec();
         for (a, b) in c0.iter().zip([1.5f32, 0.0].iter()) {
             assert!((a - b).abs() < 1e-5, "cluster 0 weighted mean {a} != {b}");
         }
         for (a, b) in c1.iter().zip([11.0f32, 10.0].iter()) {
             assert!((a - b).abs() < 1e-5, "cluster 1 weighted mean {a} != {b}");
+        }
+    }
+
+    // ---- sparse k-means ----------------------------------------
+
+    fn sparse_dataset(
+        vectors: &[(&[u16], &[f32])],
+        dim: usize,
+    ) -> PlainSparseDataset<u16, f32, DotProduct> {
+        let mut builder = PlainSparseDatasetGrowable::<u16, f32, DotProduct>::new(
+            PlainSparseQuantizer::new(dim, dim),
+        );
+        for (c, v) in vectors {
+            builder.push(SparseVectorView::new(c, v));
+        }
+        builder.into()
+    }
+
+    #[test]
+    fn update_and_split_sparse_matches_reference_means() {
+        // cluster 0: {0:1, 2:3} and {2:1, 5:2} -> {0:0.5, 2:2, 5:1}
+        // cluster 1: {7:4} and {7:2, 8:6}      -> {7:3, 8:3}
+        let dataset = sparse_dataset(
+            &[
+                (&[0, 2], &[1.0, 3.0]),
+                (&[7], &[4.0]),
+                (&[2, 5], &[1.0, 2.0]),
+                (&[7, 8], &[2.0, 6.0]),
+            ],
+            10,
+        );
+        let assignments = vec![(0.0, 0usize), (0.0, 1), (0.0, 0), (0.0, 1)];
+        let mut rng = StdRng::seed_from_u64(0);
+        let (n_splits, hist, centroids) = KMeans::update_and_split(
+            &dataset,
+            None,
+            2,
+            &assignments,
+            &mut rng,
+            false,
+            &|_: &[u32], _: &mut _| {},
+        );
+
+        assert_eq!(n_splits, 0);
+        assert_eq!(hist, vec![2.0, 2.0]);
+        let c0 = &centroids[0];
+        assert_eq!(c0.components(), &[0, 2, 5]);
+        assert_eq!(c0.values(), &[0.5, 2.0, 1.0]);
+        let c1 = &centroids[1];
+        assert_eq!(c1.components(), &[7, 8]);
+        assert_eq!(c1.values(), &[3.0, 3.0]);
+    }
+
+    #[test]
+    fn update_and_split_sparse_fires_split_on_empty_cluster() {
+        let dataset = sparse_dataset(
+            &[
+                (&[0], &[1.0]),
+                (&[0, 1], &[1.0, 1.0]),
+                (&[5], &[1.0]),
+                (&[5, 6], &[1.0, 1.0]),
+            ],
+            10,
+        );
+        let assignments = vec![(0.0, 0usize), (0.0, 0), (0.0, 1), (0.0, 1)];
+        let mut rng = StdRng::seed_from_u64(0);
+        let (n_splits, _, centroids) = KMeans::update_and_split(
+            &dataset,
+            None,
+            3,
+            &assignments,
+            &mut rng,
+            false,
+            &|_: &[u32], _: &mut _| {},
+        );
+        assert_eq!(n_splits, 1);
+        assert_eq!(centroids.len(), 3);
+        assert!(!centroids[2].is_empty(), "split centroid must not be empty");
+    }
+
+    /// Two topics on disjoint vocabularies, {0..4} and {10..14}, clustered under clustering
+    /// metric `M`. Returns the label of each point.
+    fn sparse_topic_labels<M>() -> Vec<usize>
+    where
+        M: crate::ScalarSparseSupportedDistance + From<f32>,
+    {
+        let mut vectors: Vec<(Vec<u16>, Vec<f32>)> = Vec::new();
+        let mut rng = StdRng::seed_from_u64(7);
+        for i in 0..40 {
+            let base: u16 = if i % 2 == 0 { 0 } else { 10 };
+            let comps: Vec<u16> = (base..base + 5).filter(|_| rng.gen_bool(0.7)).collect();
+            let comps = if comps.is_empty() { vec![base] } else { comps };
+            let vals = comps.iter().map(|_| rng.gen_range(0.5f32..2.0)).collect();
+            vectors.push((comps, vals));
+        }
+        let refs: Vec<(&[u16], &[f32])> = vectors
+            .iter()
+            .map(|(c, v)| (c.as_slice(), v.as_slice()))
+            .collect();
+        let dataset = sparse_dataset(&refs, 20);
+
+        let kmeans = KMeansBuilder::new()
+            .n_iter(10)
+            .n_redo(3)
+            .seed(Some(42))
+            .spherical(true)
+            .build();
+        let centroids: PlainSparseDatasetGrowable<u16, f32, M> =
+            kmeans.train(&dataset, 2, None, PlainSparseQuantizer::new(20, 20));
+        assert_eq!(centroids.len(), 2);
+
+        KMeans::compute_assignments(&dataset, &centroids)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect()
+    }
+
+    fn assert_recovers_topics(labels: &[usize]) {
+        for i in 0..labels.len() {
+            assert_eq!(labels[i], labels[i % 2], "point {i} in the wrong topic");
+        }
+        assert_ne!(labels[0], labels[1]);
+    }
+
+    /// `train_refined` applies the refinement to every centroid it keeps: here each sparse
+    /// centroid is cut to its two largest components, and the topics are still recovered.
+    #[test]
+    fn train_refined_applies_refinement() {
+        use crate::SparseVectorOwned;
+
+        let mut vectors: Vec<(Vec<u16>, Vec<f32>)> = Vec::new();
+        for i in 0..40u16 {
+            let base: u16 = if i % 2 == 0 { 0 } else { 10 };
+            let comps: Vec<u16> = (base..base + 5).collect();
+            let vals = comps.iter().map(|&c| 1.0 + ((c + i) % 3) as f32).collect();
+            vectors.push((comps, vals));
+        }
+        let refs: Vec<(&[u16], &[f32])> = vectors
+            .iter()
+            .map(|(c, v)| (c.as_slice(), v.as_slice()))
+            .collect();
+        let dataset = sparse_dataset(&refs, 20);
+
+        let top2 = |_: &[u32], centroid: &mut SparseVectorOwned<u16, f32>| {
+            let mut entries: Vec<(u16, f32)> = centroid.iter().collect();
+            entries.sort_by(|a, b| b.1.total_cmp(&a.1));
+            entries.truncate(2);
+            entries.sort_by_key(|e| e.0);
+            *centroid = SparseVectorOwned::new(
+                entries.iter().map(|e| e.0).collect(),
+                entries.iter().map(|e| e.1).collect(),
+            );
+        };
+        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42)).build();
+        let centroids: PlainSparseDatasetGrowable<u16, f32, DotProduct> =
+            kmeans.train_refined(&dataset, 2, None, PlainSparseQuantizer::new(20, 20), top2);
+
+        assert!(centroids.iter().all(|c| c.len() <= 2));
+        let labels: Vec<usize> = KMeans::compute_assignments(&dataset, &centroids)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect();
+        assert_recovers_topics(&labels);
+    }
+
+    /// `sparse_centroid_pruning` keeps each centroid within `⌈factor · average member nnz⌉`
+    /// components, keeping the largest ones, and the topics are still recovered.
+    #[test]
+    fn sparse_centroid_pruning_bounds_centroid_nnz() {
+        let mut vectors: Vec<(Vec<u16>, Vec<f32>)> = Vec::new();
+        for i in 0..40u16 {
+            let base: u16 = if i % 2 == 0 { 0 } else { 10 };
+            let comps: Vec<u16> = (base..base + 5).collect();
+            let vals = comps.iter().map(|&c| 1.0 + ((c + i) % 3) as f32).collect();
+            vectors.push((comps, vals));
+        }
+        let refs: Vec<(&[u16], &[f32])> = vectors
+            .iter()
+            .map(|(c, v)| (c.as_slice(), v.as_slice()))
+            .collect();
+        let dataset = sparse_dataset(&refs, 20);
+
+        // Every vector has 5 nonzeros, so factor 0.5 allows ⌈2.5⌉ = 3 per centroid.
+        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42)).build();
+        let centroids: PlainSparseDatasetGrowable<u16, f32, DotProduct> = kmeans.train_refined(
+            &dataset,
+            2,
+            None,
+            PlainSparseQuantizer::new(20, 20),
+            sparse_centroid_pruning(&dataset, 0.5),
+        );
+        assert!(centroids.iter().all(|c| c.len() == 3));
+        let labels: Vec<usize> = KMeans::compute_assignments(&dataset, &centroids)
+            .into_iter()
+            .map(|(_, c)| c)
+            .collect();
+        assert_recovers_topics(&labels);
+    }
+
+    #[test]
+    fn top_components_keeps_largest_magnitudes_in_component_order() {
+        let v = SparseVectorView::new(&[1_u16, 4, 6, 9], &[0.5_f32, -3.0, 2.0, 1.0]);
+        let top = top_components(v, 2);
+        assert_eq!(top.components(), &[4, 6]);
+        assert_eq!(top.values(), &[-3.0, 2.0]);
+        assert_eq!(top_components(v, 10).values(), v.values());
+    }
+
+    /// Spherical normalization works on any vector's stored values: the norm of a sparse vector
+    /// is the norm of its nonzeros, and its components are untouched; zero stays zero.
+    #[test]
+    fn normalize_l2_dense_and_sparse_values() {
+        let mut dense = crate::DenseVectorOwned::new(vec![3.0f32, 4.0]);
+        KMeans::normalize_l2(dense.as_mut());
+        assert_eq!(dense.values(), &[0.6, 0.8]);
+
+        let mut zero = crate::DenseVectorOwned::new(vec![0.0f32, 0.0]);
+        KMeans::normalize_l2(zero.as_mut());
+        assert_eq!(zero.values(), &[0.0, 0.0]);
+
+        let mut sparse = crate::SparseVectorOwned::new(vec![2u16, 7], vec![3.0f32, 4.0]);
+        KMeans::normalize_l2(sparse.as_mut());
+        assert_eq!(sparse.components(), &[2, 7]);
+        assert_eq!(sparse.values(), &[0.6, 0.8]);
+    }
+
+    /// The index variant applies the refinement too.
+    #[test]
+    fn train_with_index_refined_applies_refinement() {
+        use crate::SparseVectorOwned;
+
+        let vectors: Vec<(Vec<u16>, Vec<f32>)> = (0..40u16)
+            .map(|i| {
+                let base: u16 = if i % 2 == 0 { 0 } else { 10 };
+                let comps: Vec<u16> = (base..base + 5).collect();
+                let vals = comps.iter().map(|&c| 1.0 + ((c + i) % 3) as f32).collect();
+                (comps, vals)
+            })
+            .collect();
+        let refs: Vec<(&[u16], &[f32])> = vectors
+            .iter()
+            .map(|(c, v)| (c.as_slice(), v.as_slice()))
+            .collect();
+        let dataset = sparse_dataset(&refs, 20);
+
+        let first2 = |_: &[u32], centroid: &mut SparseVectorOwned<u16, f32>| {
+            *centroid = SparseVectorOwned::new(
+                centroid.components().iter().take(2).copied().collect(),
+                centroid.values().iter().take(2).copied().collect(),
+            );
+        };
+        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42)).build();
+        let centroids: PlainSparseDatasetGrowable<u16, f32, DotProduct> = kmeans
+            .train_with_index_refined(
+                &dataset,
+                2,
+                None,
+                PlainSparseQuantizer::new(20, 20),
+                FlatIndex::from,
+                &(),
+                first2,
+            );
+        assert!(centroids.iter().all(|c| c.len() <= 2));
+    }
+
+    #[test]
+    fn train_sparse_dot_product_recovers_disjoint_topics() {
+        assert_recovers_topics(&sparse_topic_labels::<DotProduct>());
+    }
+
+    #[test]
+    fn train_sparse_euclidean_recovers_disjoint_topics() {
+        assert_recovers_topics(&sparse_topic_labels::<SquaredEuclideanDistance>());
+    }
+
+    #[test]
+    fn update_sparse_deterministic_across_thread_counts() {
+        let n = 2000usize;
+        let dim = 500usize;
+        let k = 32usize;
+        let mut data_rng = StdRng::seed_from_u64(42);
+        let mut vectors: Vec<(Vec<u16>, Vec<f32>)> = Vec::new();
+        for _ in 0..n {
+            let mut comps: Vec<u16> = (0..20).map(|_| data_rng.gen_range(0..dim as u16)).collect();
+            comps.sort_unstable();
+            comps.dedup();
+            let vals = comps
+                .iter()
+                .map(|_| data_rng.gen_range(0.0f32..1.0))
+                .collect();
+            vectors.push((comps, vals));
+        }
+        let refs: Vec<(&[u16], &[f32])> = vectors
+            .iter()
+            .map(|(c, v)| (c.as_slice(), v.as_slice()))
+            .collect();
+        let dataset = sparse_dataset(&refs, dim);
+        let assignments: Vec<(f32, usize)> = (0..n).map(|i| (0.0f32, i % k)).collect();
+
+        let mut reference: Option<Vec<u32>> = None;
+        for t in [1usize, 2, 4, 8] {
+            let bits = rayon::ThreadPoolBuilder::new()
+                .num_threads(t)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let mut rng = StdRng::seed_from_u64(0);
+                    let (_, _, centroids) = KMeans::update_and_split(
+                        &dataset,
+                        None,
+                        k,
+                        &assignments,
+                        &mut rng,
+                        true,
+                        &|_: &[u32], _: &mut _| {},
+                    );
+                    centroids
+                        .iter()
+                        .flat_map(|c| c.values().iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+                        .collect::<Vec<u32>>()
+                });
+            match &reference {
+                None => reference = Some(bits),
+                Some(ref_bits) => {
+                    assert_eq!(&bits, ref_bits, "centroid bits differ at thread count {t}")
+                }
+            }
         }
     }
 }

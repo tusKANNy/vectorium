@@ -275,6 +275,23 @@ where
     }
 }
 
+/// The stored values do not depend on the metric.
+impl<C, InValue, OutValue, D, D2> crate::core::vector_encoder::WithDistance<D2>
+    for ScalarSparseQuantizer<C, InValue, OutValue, D>
+where
+    C: ComponentType,
+    InValue: ValueType + Float,
+    OutValue: ValueType + Float + FromF32,
+    D: ScalarSparseSupportedDistance,
+    D2: ScalarSparseSupportedDistance,
+{
+    type Output = ScalarSparseQuantizer<C, InValue, OutValue, D2>;
+
+    fn with_distance(&self) -> Self::Output {
+        ScalarSparseQuantizer::new(self.dim, self.dim)
+    }
+}
+
 impl<C, InValue, OutValue, D> VectorEncoder for ScalarSparseQuantizer<C, InValue, OutValue, D>
 where
     C: ComponentType,

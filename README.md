@@ -18,7 +18,7 @@ Vectorium includes an exhaustive search API (`FlatIndex`, which implements the `
 
 | Feature | What it enables | Default |
 |---------|-----------------|:-------:|
-| `multivec` | `DenseMultiVectorView/Owned`, `MultiVectorDataset`, `RerankIndex`, and all multivec encoders (`PlainMultiVecQuantizer`, `MultiVecProductQuantizer`, `MultiVecTwoLevelProductQuantizer`) | No |
+| `multivec` | `DenseMultiVectorView/Owned`, `MultiVectorDataset`, and all multivec encoders (`PlainMultiVecQuantizer`, `MultiVecProductQuantizer`, `MultiVecTwoLevelProductQuantizer`) | No |
 | `cli` | The `compute_groundtruth` binary | No |
 
 ### Building
@@ -35,7 +35,7 @@ If you want the **`compute_groundtruth` CLI binary** (dense and sparse):
 RUSTFLAGS="-C target-cpu=native" cargo build --release --features cli
 ```
 
-If you want **multivector support** in the library (adds `MultiVectorDataset`, `RerankIndex`, all multivec encoders):
+If you want **multivector support** in the library (adds `MultiVectorDataset`, all multivec encoders):
 ```bash
 RUSTFLAGS="-C target-cpu=native" cargo build --release --features multivec
 ```

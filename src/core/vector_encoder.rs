@@ -102,6 +102,20 @@ pub trait VectorEncoder: Send + Sync + SpaceUsage + Clone {
     }
 }
 
+/// An encoder whose stored codes do not depend on its metric, so the same codes can also be
+/// scored under the metric `D2`: [`with_distance`](Self::with_distance) returns an encoder whose
+/// evaluators read the encoded vectors of a dataset built by `self`, without re-encoding them.
+pub trait WithDistance<D2>: VectorEncoder {
+    type Output: for<'a> VectorEncoder<
+            Distance = D2,
+            EncodedVector<'a> = Self::EncodedVector<'a>,
+            QueryVector<'a> = Self::QueryVector<'a>,
+            QueryParams = Self::QueryParams,
+        >;
+
+    fn with_distance(&self) -> Self::Output;
+}
+
 /// Encoder contract for dense vectors.
 ///
 /// The encoder consumes plain dense inputs (`DenseVectorView`) and produces dense
@@ -124,6 +138,14 @@ pub trait DenseVectorEncoder:
     ///
     /// Intended for index build and other internal workflows.
     fn decode_vector<'a>(&self, encoded: Self::EncodedVector<'a>) -> DenseVectorOwned<f32>;
+
+    /// Decode an encoded vector into `out`, which must have length `input_dim`, without
+    /// allocating when the encoder supports it. The default goes through
+    /// [`decode_vector`](Self::decode_vector).
+    #[inline]
+    fn decode_into<'a>(&self, encoded: Self::EncodedVector<'a>, out: &mut [f32]) {
+        out.copy_from_slice(self.decode_vector(encoded).values());
+    }
 
     /// Encode `input` into the provided `output` container.
     ///

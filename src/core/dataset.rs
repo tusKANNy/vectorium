@@ -235,6 +235,40 @@ where
     }
 }
 
+/// A dataset whose vectors can be averaged, which is what k-means needs from a representation
+/// to compute its centroids (see [`KMeans`](crate::KMeans)).
+pub trait MeanDataset: Dataset {
+    /// An `f32` vector in the dataset's input space: a decoded vector or a mean.
+    ///
+    /// Its values, exposed through `AsMut<[f32]>`, are the vector's stored coordinates: all of
+    /// them for a dense vector, the nonzeros for a sparse one. Representation-independent code
+    /// (k-means) may therefore compute a norm over them or scale them, without knowing which
+    /// representation it holds.
+    type Vector: AsMut<[f32]> + Clone + Send;
+
+    /// The vector `id`, decoded to `f32`.
+    fn vector(&self, id: u32) -> Self::Vector;
+
+    /// Overwrite `out` with the vector `id` decoded to `f32`, reusing its storage where the
+    /// representation allows. `out` must come from this dataset ([`vector`](Self::vector) or
+    /// [`mean`](Self::mean)).
+    #[inline]
+    fn vector_into(&self, id: u32, out: &mut Self::Vector) {
+        *out = self.vector(id);
+    }
+
+    /// The weighted mean of the vectors `ids`, accumulated in `f32` in the order given.
+    ///
+    /// `weights`, if any, is indexed by vector id. An empty `ids` yields an all-zero (dense) or
+    /// empty (sparse) vector.
+    fn mean(&self, ids: &[u32], weights: Option<&[f32]>) -> Self::Vector;
+
+    /// The residual `v − c` of the vector `id` against `centroid`, a vector of this dataset's
+    /// input space (e.g. a [`mean`](Self::mean)). For a sparse dataset its nonzeros are the
+    /// union of the two vectors' components.
+    fn residual(&self, id: u32, centroid: &Self::Vector) -> Self::Vector;
+}
+
 /// Marker trait representing any dataset whose encoder exposes the dense-vector contract.
 ///
 /// Dense layout, query expectations, and decoding helpers are defined by `DenseVectorEncoder`,

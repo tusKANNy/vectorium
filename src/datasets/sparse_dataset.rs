@@ -2,10 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::hint::assert_unchecked;
 
 use crate::SpaceUsage;
+use crate::core::dataset::MeanDataset;
 use crate::core::dataset::{assert_valid_permutation, invert_permutation};
 use crate::core::sealed;
 use crate::core::storage::{GrowableSparseStorage, ImmutableSparseStorage, SparseStorage};
-use crate::core::vector::SparseVectorView;
+use crate::core::vector::{SparseVectorOwned, SparseVectorView};
 use crate::core::vector_encoder::{SparseVectorEncoder, VectorEncoder};
 use crate::utils::{is_strictly_sorted, prefetch_read_slice};
 use crate::{ComponentType, Float, FromF32, ValueType, VectorId};
@@ -13,6 +14,7 @@ use crate::{Dataset, DatasetGrowable, SparseData};
 use num_traits::AsPrimitive;
 
 use crate::dataset::ConvertFrom;
+use crate::distances::{DotProduct, SquaredEuclideanDistance};
 
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSlice};
 
@@ -174,6 +176,71 @@ where
             };
             SparseVectorView::new(&components[start..end], &values[start..end])
         })
+    }
+}
+
+impl<E, S> MeanDataset for SparseDatasetGeneric<E, S>
+where
+    E: SparseVectorEncoder,
+    S: SparseStorage<E>,
+{
+    type Vector = SparseVectorOwned<E::InputComponentType, f32>;
+
+    fn vector(&self, id: u32) -> Self::Vector {
+        self.encoder().decode_vector(self.get(id as VectorId))
+    }
+
+    fn residual(&self, id: u32, centroid: &Self::Vector) -> Self::Vector {
+        let v = self.encoder().decode_vector(self.get(id as VectorId));
+        let (vc, vv) = (v.components(), v.values());
+        let (cc, cv) = (centroid.components(), centroid.values());
+        let mut components = Vec::with_capacity(vc.len() + cc.len());
+        let mut values = Vec::with_capacity(vc.len() + cc.len());
+        let (mut i, mut j) = (0, 0);
+        while i < vc.len() || j < cc.len() {
+            if j == cc.len() || (i < vc.len() && vc[i] < cc[j]) {
+                components.push(vc[i]);
+                values.push(vv[i]);
+                i += 1;
+            } else if i == vc.len() || cc[j] < vc[i] {
+                components.push(cc[j]);
+                values.push(-cv[j]);
+                j += 1;
+            } else {
+                components.push(vc[i]);
+                values.push(vv[i] - cv[j]);
+                i += 1;
+                j += 1;
+            }
+        }
+        SparseVectorOwned::new(components, values)
+    }
+
+    /// The exact mean: its nonzeros are the union of the members' components.
+    fn mean(&self, ids: &[u32], weights: Option<&[f32]>) -> Self::Vector {
+        let mut entries: Vec<(E::InputComponentType, f32)> = Vec::new();
+        let mut count = 0.0f32;
+        for &i in ids {
+            let w = weights.map_or(1.0, |w| w[i as usize]);
+            count += w;
+            let vector = self.encoder().decode_vector(self.get(i as VectorId));
+            entries.extend(vector.iter().map(|(c, x)| (c, x * w)));
+        }
+        // Stable sort: equal components keep member order, so the sums are deterministic.
+        entries.sort_by_key(|&(c, _)| c);
+        let inv = if count > 0.0 { 1.0 / count } else { 0.0 };
+        let mut components = Vec::new();
+        let mut values: Vec<f32> = Vec::new();
+        for (c, x) in entries {
+            if components.last() == Some(&c) {
+                *values.last_mut().unwrap() += x;
+            } else {
+                components.push(c);
+                values.push(x);
+            }
+        }
+        values.iter_mut().for_each(|v| *v *= inv);
+        SparseVectorOwned::new(components, values)
     }
 }
 
@@ -564,6 +631,49 @@ where
         SparseDatasetGeneric {
             storage,
             encoder: crate::ScalarSparseQuantizer::<C, InValue, OutValue, D>::new(dim, dim),
+        }
+    }
+}
+
+/// Convert ScalarSparseDataset from SquaredEuclideanDistance to DotProduct without copying data
+impl<C, InValue, OutValue>
+    From<
+        SparseDataset<crate::ScalarSparseQuantizer<C, InValue, OutValue, SquaredEuclideanDistance>>,
+    > for SparseDataset<crate::ScalarSparseQuantizer<C, InValue, OutValue, DotProduct>>
+where
+    C: ComponentType,
+    InValue: ValueType + Float,
+    OutValue: ValueType + Float + FromF32,
+{
+    fn from(
+        dataset: SparseDataset<
+            crate::ScalarSparseQuantizer<C, InValue, OutValue, SquaredEuclideanDistance>,
+        >,
+    ) -> Self {
+        let dim = dataset.encoder.output_dim();
+        SparseDatasetGeneric {
+            storage: dataset.storage.relabel(),
+            encoder: crate::ScalarSparseQuantizer::new(dim, dim),
+        }
+    }
+}
+
+/// Convert ScalarSparseDataset from DotProduct to SquaredEuclideanDistance without copying data
+impl<C, InValue, OutValue>
+    From<SparseDataset<crate::ScalarSparseQuantizer<C, InValue, OutValue, DotProduct>>>
+    for SparseDataset<crate::ScalarSparseQuantizer<C, InValue, OutValue, SquaredEuclideanDistance>>
+where
+    C: ComponentType,
+    InValue: ValueType + Float,
+    OutValue: ValueType + Float + FromF32,
+{
+    fn from(
+        dataset: SparseDataset<crate::ScalarSparseQuantizer<C, InValue, OutValue, DotProduct>>,
+    ) -> Self {
+        let dim = dataset.encoder.output_dim();
+        SparseDatasetGeneric {
+            storage: dataset.storage.relabel(),
+            encoder: crate::ScalarSparseQuantizer::new(dim, dim),
         }
     }
 }
@@ -1028,6 +1138,31 @@ mod tests {
         assert!(ranges.windows(2).all(|w| w[0].end == w[1].start));
         let lengths: Vec<usize> = ranges.iter().map(|r| r.end - r.start).collect();
         assert_eq!(lengths, vec![1, 4, 3, 2]);
+    }
+
+    #[test]
+    fn sparse_residual_merges_components() {
+        use crate::core::dataset::MeanDataset;
+        use crate::core::vector::SparseVectorOwned;
+        // Row 0 is {0: 1.0, 1: 1.5, 2: 2.0}; the centroid shares 1, adds 5, misses 0 and 2.
+        let c = SparseVectorOwned::new(vec![1_u16, 5], vec![0.5_f32, 2.0]);
+        let r = permutable_sparse().residual(0, &c);
+        assert_eq!(r.components(), &[0, 1, 2, 5]);
+        assert_eq!(r.values(), &[1.0, 1.0, 2.0, -2.0]);
+    }
+
+    #[test]
+    fn sparse_metric_relabel_keeps_the_data() {
+        let dataset = permutable_sparse();
+        let l2: PlainSparseDataset<u16, f32, crate::SquaredEuclideanDistance> =
+            dataset.clone().into();
+        assert_eq!(l2.len(), dataset.len());
+        for (a, b) in l2.iter().zip(dataset.iter()) {
+            assert_eq!(a.components(), b.components());
+            assert_eq!(a.values(), b.values());
+        }
+        let back: PlainSparseDataset<u16, f32, DotProduct> = l2.into();
+        assert_eq!(back, dataset);
     }
 
     #[test]
