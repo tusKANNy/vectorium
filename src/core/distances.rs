@@ -23,6 +23,17 @@ pub trait Distance: Ord + Copy + Send + Sync + 'static {
     /// Return the numeric distance value.
     fn distance(&self) -> f32;
 
+    /// Whether `self` ranks strictly before `other`, i.e. is the better result.
+    ///
+    /// The default is `self < other`, the [`Ord`] ranking, which compares with `f32::total_cmp`.
+    /// Metrics override it with a plain float comparison, much cheaper in hot loops such as
+    /// k-means' flat assignment. The two answers agree on every pair of distances (never NaN)
+    /// except `-0.0` vs `+0.0`, which a float comparison sees as equal.
+    #[inline]
+    fn is_better_than(&self, other: &Self) -> bool {
+        self < other
+    }
+
     /// Returns true if self satisfies a relaxed threshold comparison.
     ///
     /// The relaxation parameter `lambda` (typically 0.0 to 0.5) controls how much
@@ -64,6 +75,11 @@ pub struct SquaredEuclideanDistance(f32);
 impl Distance for SquaredEuclideanDistance {
     fn distance(&self) -> f32 {
         self.0
+    }
+
+    #[inline]
+    fn is_better_than(&self, other: &Self) -> bool {
+        self.0 < other.0
     }
 
     #[inline]
@@ -136,6 +152,11 @@ pub struct DotProduct(pub f32);
 impl Distance for DotProduct {
     fn distance(&self) -> f32 {
         self.0
+    }
+
+    #[inline]
+    fn is_better_than(&self, other: &Self) -> bool {
+        self.0 > other.0
     }
 
     #[inline]

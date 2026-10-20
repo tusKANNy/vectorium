@@ -203,7 +203,13 @@ impl<const M: usize, In> MultiVecTwoLevelProductQuantizer<M, In> {
         let coarse_centroids: PlainDenseDataset<f32, SquaredEuclideanDistance> =
             KMeansBuilder::new()
                 .build()
-                .train(token_vectors, ncoarse, None);
+                .train::<_, PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance>>(
+                    token_vectors,
+                    ncoarse,
+                    None,
+                    PlainDenseQuantizer::new(token_dim),
+                )
+                .into();
 
         // Step 2: Compute residuals in parallel.
         println!("  Step 2: computing residuals ({} vectors)...", n);
@@ -252,7 +258,15 @@ impl<const M: usize, In> MultiVecTwoLevelProductQuantizer<M, In> {
                         &vec.values()[m * dsub..(m + 1) * dsub],
                     ));
                 }
-                KMeansBuilder::new().build().train(&sub_ds, KSUB, None)
+                KMeansBuilder::new()
+                    .build()
+                    .train::<_, PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance>>(
+                        &sub_ds,
+                        KSUB,
+                        None,
+                        PlainDenseQuantizer::new(dsub),
+                    )
+                    .into()
             })
             .collect();
 

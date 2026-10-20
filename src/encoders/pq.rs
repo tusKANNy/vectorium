@@ -141,7 +141,8 @@ where
                 }
 
                 let kmeans = KMeansBuilder::new().n_iter(n_iter).seed(seed).build();
-                let trained = kmeans.train(&sub_dataset, KSUB, None);
+                let trained: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> =
+                    kmeans.train(&sub_dataset, KSUB, None, PlainDenseQuantizer::new(dsub));
                 // KMeans returns AoS: [c0_d0, c0_d1, .., c0_{dsub-1}, c1_d0, ..]
                 // Transpose to SoA: [d0_c0, d0_c1, .., d0_{KSUB-1}, d1_c0, ..]
                 let aos = trained.values();
@@ -492,6 +493,24 @@ where
                 .map(|(i, _)| i as u8)
                 .unwrap_or(0);
             output.extend(std::iter::once(best_idx));
+        }
+    }
+}
+
+/// The codebooks and codes do not depend on the metric, only the query distance table does.
+impl<const M: usize, D, D2> crate::core::vector_encoder::WithDistance<D2> for ProductQuantizer<M, D>
+where
+    D: ProductQuantizerDistance,
+    D2: ProductQuantizerDistance,
+{
+    type Output = ProductQuantizer<M, D2>;
+
+    fn with_distance(&self) -> Self::Output {
+        ProductQuantizer {
+            d: self.d,
+            dsub: self.dsub,
+            centroids: self.centroids.clone(),
+            _distance: PhantomData,
         }
     }
 }

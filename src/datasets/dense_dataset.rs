@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::SpaceUsage;
+use crate::core::dataset::MeanDataset;
 use crate::core::dataset::{assert_valid_permutation, invert_permutation};
 use crate::core::sealed;
+use crate::core::vector::DenseVectorOwned;
 use crate::core::vector_encoder::{DenseVectorEncoder, VectorEncoder};
 use crate::{Dataset, DatasetGrowable, VectorId};
 
@@ -164,6 +166,52 @@ where
             let end = start + m;
             DenseVectorView::new(&data[start..end])
         })
+    }
+}
+
+impl<E, Data> MeanDataset for DenseDatasetGeneric<E, Data>
+where
+    E: DenseVectorEncoder,
+    Data: AsRef<[E::OutputValueType]>,
+{
+    type Vector = DenseVectorOwned<f32>;
+
+    fn vector(&self, id: u32) -> Self::Vector {
+        self.encoder().decode_vector(self.get(id as VectorId))
+    }
+
+    #[inline]
+    fn vector_into(&self, id: u32, out: &mut Self::Vector) {
+        self.encoder()
+            .decode_into(self.get(id as VectorId), out.as_mut());
+    }
+
+    fn residual(&self, id: u32, centroid: &Self::Vector) -> Self::Vector {
+        let mut v = self.vector(id);
+        for (x, &c) in v.as_mut().iter_mut().zip(centroid.values()) {
+            *x -= c;
+        }
+        v
+    }
+
+    fn mean(&self, ids: &[u32], weights: Option<&[f32]>) -> Self::Vector {
+        let mut sum = vec![0.0f32; self.input_dim()];
+        let mut decoded = vec![0.0f32; self.input_dim()];
+        let mut count = 0.0f32;
+        for &i in ids {
+            let w = weights.map_or(1.0, |w| w[i as usize]);
+            count += w;
+            self.encoder()
+                .decode_into(self.get(i as VectorId), &mut decoded);
+            for (s, &x) in sum.iter_mut().zip(&decoded) {
+                *s += x * w;
+            }
+        }
+        if count > 0.0 {
+            let inv = 1.0 / count;
+            sum.iter_mut().for_each(|s| *s *= inv);
+        }
+        DenseVectorOwned::new(sum)
     }
 }
 
@@ -597,6 +645,14 @@ mod tests {
             growable.push(DenseVectorView::new(&[base, base + 1.0]));
         }
         growable.into()
+    }
+
+    #[test]
+    fn dense_residual_subtracts_per_coordinate() {
+        use crate::core::dataset::MeanDataset;
+        let c = crate::DenseVectorOwned::new(vec![1.0_f32, 2.5]);
+        let r = permutable_dense().residual(1, &c);
+        assert_eq!(r.values(), &[19.0, 18.5]);
     }
 
     #[test]

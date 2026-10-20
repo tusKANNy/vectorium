@@ -549,6 +549,23 @@ impl<D: RabitqSupportedDistance> DenseVectorEncoder for RabitqQuantizer<D> {
     }
 }
 
+/// Document codes are identical under either metric; only the query path differs.
+impl<D, D2> crate::core::vector_encoder::WithDistance<D2> for RabitqQuantizer<D>
+where
+    D: RabitqSupportedDistance,
+    D2: RabitqSupportedDistance,
+{
+    type Output = RabitqQuantizer<D2>;
+
+    fn with_distance(&self) -> Self::Output {
+        RabitqQuantizer {
+            space: self.space.clone(),
+            config: self.config,
+            _distance: PhantomData,
+        }
+    }
+}
+
 impl<D: RabitqSupportedDistance> VectorEncoder for RabitqQuantizer<D> {
     type Distance = D;
     type InputVector<'a> = DenseVectorView<'a, f32>;

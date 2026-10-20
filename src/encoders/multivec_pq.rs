@@ -156,7 +156,14 @@ impl<const M: usize, In> MultiVecProductQuantizer<M, In> {
                     sub_dataset.push(sub);
                 }
                 let kmeans = KMeansBuilder::new().build();
-                kmeans.train(&sub_dataset, KSUB, None)
+                kmeans
+                    .train::<_, PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance>>(
+                        &sub_dataset,
+                        KSUB,
+                        None,
+                        PlainDenseQuantizer::new(dsub),
+                    )
+                    .into()
             })
             .collect();
 

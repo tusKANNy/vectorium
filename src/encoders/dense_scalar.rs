@@ -118,6 +118,17 @@ where
         DenseVectorOwned::new(values)
     }
 
+    #[inline]
+    fn decode_into<'a>(
+        &self,
+        encoded: DenseVectorView<'a, Self::OutputValueType>,
+        out: &mut [f32],
+    ) {
+        for (o, &v) in out.iter_mut().zip(encoded.values()) {
+            *o = v.to_f32_fast();
+        }
+    }
+
     /// Encode the input view into an existing buffer to avoid temporary allocations.
     #[inline]
     fn push_encoded<'a, OutputContainer>(
@@ -181,6 +192,22 @@ where
     #[inline]
     fn compute_distances_batch6(&self, vectors: [DenseVectorView<'v, Out>; 6]) -> [D; 6] {
         D::compute_dense_batch6(self.query.as_view(), vectors)
+    }
+}
+
+/// The stored values do not depend on the metric.
+impl<In, Out, D, D2> crate::core::vector_encoder::WithDistance<D2>
+    for ScalarDenseQuantizer<In, Out, D>
+where
+    In: ValueType + Float,
+    Out: ValueType + Float + FromF32,
+    D: ScalarDenseSupportedDistance,
+    D2: ScalarDenseSupportedDistance,
+{
+    type Output = ScalarDenseQuantizer<In, Out, D2>;
+
+    fn with_distance(&self) -> Self::Output {
+        ScalarDenseQuantizer::new(self.d)
     }
 }
 

@@ -52,10 +52,10 @@ pub use core::distances::{Distance, DotProduct, SquaredEuclideanDistance};
 pub use core::vector_encoder::MultiVecEncoder;
 pub use core::vector_encoder::{
     DenseVectorEncoder, PackedSparseVectorEncoder, QueryEvaluator, SparseVectorEncoder,
-    VectorEncoder,
+    VectorEncoder, WithDistance,
 };
 
-pub use clustering::{KMeans, KMeansBuilder};
+pub use clustering::{KMeans, KMeansBuilder, sparse_centroid_pruning};
 
 pub use encoders::rabitq::{
     RabitqConfig, RabitqQuantizer, RabitqQueryEvaluator, RabitqQueryParams, RabitqSupportedDistance,
@@ -86,7 +86,7 @@ pub use encoders::sparse_scalar::{
     ScalarSparseQuantizerDotProduct, ScalarSparseQueryEvaluator, ScalarSparseSupportedDistance,
 };
 
-pub use core::dataset::{Dataset, DatasetGrowable, DenseData, SparseData, VectorId};
+pub use core::dataset::{Dataset, DatasetGrowable, DenseData, MeanDataset, SparseData, VectorId};
 pub use core::flat_index::FlatIndex;
 pub use core::index::{Index, IndexStats};
 pub use core::storage::{
@@ -221,15 +221,145 @@ pub trait IndexSerializer: Sized {
 
 impl<T> IndexSerializer for T where T: Dataset {}
 
-/// A [`RerankIndex`](core::rerank_index::RerankIndex) is not a [`Dataset`], so the blanket impl
-/// above does not reach it, but it derives `Serialize`/`Deserialize` and therefore serializes
-/// through the same single-file bincode format as every other index.
-impl<FirstStageIndex, RerankDataset> IndexSerializer
-    for core::rerank_index::RerankIndex<FirstStageIndex, RerankDataset>
-where
-    FirstStageIndex: core::index::Index,
-    RerankDataset: Dataset,
-{
+#[cfg(test)]
+mod with_distance_tests {
+    use crate::core::dataset::ConvertFrom;
+    use crate::{
+        Dataset, DenseDataset, DenseVectorView, Distance, DotProduct, PlainDenseDataset,
+        QueryEvaluator, RabitqConfig, RabitqExtConfig, RabitqExtQuantizer, RabitqQuantizer,
+        RabitqQueryParams, SquaredEuclideanDistance, VectorEncoder, WithDistance,
+    };
+
+    fn data(n: usize, dim: usize) -> PlainDenseDataset<f32, DotProduct> {
+        let values: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 7919 % 1000) as f32 / 100.0) - 5.0)
+            .collect();
+        PlainDenseDataset::from_raw(
+            values.into_boxed_slice(),
+            n,
+            crate::ScalarDenseQuantizer::new(dim),
+        )
+    }
+
+    /// Scoring dot-product-built codes under L2 through `with_distance` gives the distances of
+    /// the same encoder built for L2 (RaBitQ codes are metric-independent and deterministic).
+    #[test]
+    fn rabitq_codes_score_under_the_other_metric() {
+        let ds = data(50, 128);
+        let q: Vec<f32> = (0..128).map(|i| (i % 13) as f32 / 3.0).collect();
+        let q = DenseVectorView::new(&q);
+        let qp = RabitqQueryParams { query_bits: 4 };
+
+        let dp: DenseDataset<RabitqQuantizer<DotProduct>> =
+            ConvertFrom::convert_from(&ds, RabitqConfig::default());
+        let l2: DenseDataset<RabitqQuantizer<SquaredEuclideanDistance>> =
+            ConvertFrom::convert_from(&ds, RabitqConfig::default());
+        let relabelled = WithDistance::<SquaredEuclideanDistance>::with_distance(dp.encoder());
+        let (a, b) = (
+            relabelled.query_evaluator(q, &qp),
+            l2.encoder().query_evaluator(q, &qp),
+        );
+        for i in 0..ds.len() as u64 {
+            assert_eq!(a.compute_distance(dp.get(i)), b.compute_distance(l2.get(i)));
+        }
+
+        let config = RabitqExtConfig::default();
+        let dp: DenseDataset<RabitqExtQuantizer<DotProduct>> =
+            ConvertFrom::convert_from(&ds, config);
+        let l2: DenseDataset<RabitqExtQuantizer<SquaredEuclideanDistance>> =
+            ConvertFrom::convert_from(&ds, config);
+        let relabelled = WithDistance::<SquaredEuclideanDistance>::with_distance(dp.encoder());
+        let (a, b) = (
+            relabelled.query_evaluator(q, &()),
+            l2.encoder().query_evaluator(q, &()),
+        );
+        for i in 0..ds.len() as u64 {
+            assert_eq!(a.compute_distance(dp.get(i)), b.compute_distance(l2.get(i)));
+        }
+    }
+
+    /// Sparse scalar values scored under L2 through `with_distance` give the exact `‖q − v‖²`,
+    /// for f32 and f16 storage (each against its decoded values).
+    #[test]
+    fn sparse_scalar_values_score_under_the_other_metric() {
+        use crate::core::vector::SparseVectorView;
+        use crate::{
+            DatasetGrowable, PlainSparseDataset, PlainSparseDatasetGrowable, PlainSparseQuantizer,
+            ScalarSparseDataset, core::vector_encoder::SparseDataEncoder,
+        };
+        let mut g = PlainSparseDatasetGrowable::<u16, f32, DotProduct>::new(
+            PlainSparseQuantizer::new(16, 16),
+        );
+        g.push(SparseVectorView::new(
+            &[0_u16, 3, 9],
+            &[1.5_f32, -2.0, 0.25],
+        ));
+        g.push(SparseVectorView::new(
+            &[1_u16, 3, 15],
+            &[4.0_f32, 0.5, -1.0],
+        ));
+        g.push(SparseVectorView::new(&[7_u16], &[3.0_f32]));
+        let ds: PlainSparseDataset<u16, f32, DotProduct> = g.into();
+        let (qc, qv) = ([0_u16, 3, 7, 15], [2.0_f32, 1.0, -1.5, 0.5]);
+        let q = SparseVectorView::new(&qc, &qv);
+        let dense = |c: &[u16], v: &[f32]| {
+            let mut d = vec![0.0f32; 16];
+            for (&ci, &vi) in c.iter().zip(v) {
+                d[ci as usize] = vi;
+            }
+            d
+        };
+        let qd = dense(&qc, &qv);
+
+        let l2 = WithDistance::<SquaredEuclideanDistance>::with_distance(ds.encoder());
+        let e = l2.query_evaluator(q, &());
+        for i in 0..ds.len() as u64 {
+            let v = ds.get(i);
+            let vd = dense(v.components(), v.values());
+            let exact: f32 = qd.iter().zip(&vd).map(|(a, b)| (a - b) * (a - b)).sum();
+            assert_eq!(e.compute_distance(v).distance(), exact);
+        }
+
+        let ds16: ScalarSparseDataset<u16, f32, half::f16, DotProduct> =
+            ConvertFrom::convert_from(&ds, ());
+        let l2 = WithDistance::<SquaredEuclideanDistance>::with_distance(ds16.encoder());
+        let e = l2.query_evaluator(q, &());
+        for i in 0..ds16.len() as u64 {
+            let decoded = ds16.encoder().decode_vector(ds16.get(i));
+            let vd = dense(decoded.components(), decoded.values());
+            let exact: f32 = qd.iter().zip(&vd).map(|(a, b)| (a - b) * (a - b)).sum();
+            let got = e.compute_distance(ds16.get(i)).distance();
+            assert!(
+                (got - exact).abs() <= 1e-5 * exact.max(1.0),
+                "{got} vs {exact}"
+            );
+        }
+    }
+
+    /// PQ codes scored under L2 through `with_distance` give `‖q − decode(code)‖²`.
+    #[test]
+    fn pq_codes_score_under_the_other_metric() {
+        use crate::DenseVectorEncoder;
+        use crate::encoders::pq::ProductQuantizer;
+        let ds = data(600, 32);
+        let q: Vec<f32> = (0..32).map(|i| (i % 5) as f32).collect();
+        let dp: DenseDataset<ProductQuantizer<8, DotProduct>> = ConvertFrom::convert_from(&ds, ());
+        let l2 = WithDistance::<SquaredEuclideanDistance>::with_distance(dp.encoder());
+        let e = l2.query_evaluator(DenseVectorView::new(&q), &());
+        for i in 0..ds.len() as u64 {
+            let decoded = dp.encoder().decode_vector(dp.get(i));
+            let exact: f32 = q
+                .iter()
+                .zip(decoded.values())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            let got = e.compute_distance(dp.get(i)).distance();
+            assert!(
+                (got - exact).abs() <= 1e-3 * exact.max(1.0),
+                "{got} vs {exact}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,45 +401,6 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         assert_eq!(dataset, loaded);
-    }
-
-    /// A `RerankIndex` round-trips as one file, carrying both stages.
-    ///
-    /// It is not a `Dataset`, so it reaches `IndexSerializer` through its own impl rather than
-    /// the blanket one; this pins that the impl is present and that both stages survive.
-    #[test]
-    fn index_serializer_round_trip_rerank_index() {
-        use crate::core::flat_index::FlatIndex;
-        use crate::core::rerank_index::RerankIndex;
-        use crate::encoders::dense_scalar::PlainDenseQuantizer;
-
-        type Enc = PlainDenseQuantizer<f32, DotProduct>;
-        fn dataset(vectors: &[[f32; 2]]) -> DenseDataset<Enc> {
-            let mut growable = DenseDatasetGrowable::new(Enc::new(2));
-            for vector in vectors {
-                growable.push(DenseVectorView::new(vector));
-            }
-            growable.into()
-        }
-
-        let first_stage = dataset(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]);
-        let rerank = dataset(&[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]);
-        let index = RerankIndex::new(FlatIndex::from(first_stage), rerank);
-
-        let query = DenseVectorView::new(&[1.0f32, 1.0]);
-        let expected = index.search(query, query, 3, 3, &(), &(), None, None, false);
-
-        let path = temp_path("rerank_round_trip");
-        index.save_index(path.to_str().unwrap()).unwrap();
-        let loaded: RerankIndex<FlatIndex<DenseDataset<Enc>>, DenseDataset<Enc>> =
-            RerankIndex::load_index(path.to_str().unwrap()).unwrap();
-        std::fs::remove_file(&path).unwrap();
-
-        assert_eq!(loaded.len(), index.len());
-        let actual = loaded.search(query, query, 3, 3, &(), &(), None, None, false);
-        let expected_ids: Vec<_> = expected.iter().map(|s| s.vector).collect();
-        let actual_ids: Vec<_> = actual.iter().map(|s| s.vector).collect();
-        assert_eq!(actual_ids, expected_ids);
     }
 
     #[test]
