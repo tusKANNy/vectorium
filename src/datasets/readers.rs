@@ -9,11 +9,10 @@ use std::io::{BufReader, Read};
 use ndarray::Array2;
 use ndarray_npy::ReadNpyExt;
 
-use crate::DatasetGrowable;
 use crate::encoders::dense_scalar::{PlainDenseQuantizer, ScalarDenseSupportedDistance};
 use crate::encoders::sparse_scalar::{PlainSparseQuantizer, ScalarSparseSupportedDistance};
 use crate::{ComponentType, Float, FromF32, SpaceUsage, ValueType};
-use crate::{PlainDenseDataset, PlainSparseDataset, PlainSparseDatasetGrowable};
+use crate::{PlainDenseDataset, PlainSparseDataset};
 
 /// Error type for dataset reading operations.
 #[derive(Debug)]
@@ -137,6 +136,7 @@ where
 /// Returns `ReaderError` if:
 /// - File cannot be read
 /// - Component values overflow the type C (e.g., reading a value > 2^16 when C is u16)
+/// - The components of a vector are not strictly ascending
 pub fn read_seismic_format_limit<C, V, D>(
     filename: impl AsRef<Path>,
     limit: Option<usize>,
@@ -147,87 +147,70 @@ where
     D: ScalarSparseSupportedDistance,
 {
     let path = Path::new(filename.as_ref());
-    let mut buffer_d = [0_u8; std::mem::size_of::<u32>()];
-    let mut buffer = [0_u8; std::mem::size_of::<f32>()];
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len() as usize;
+    let mut br = BufReader::with_capacity(1 << 22, file);
+    let invalid = |msg: String| ReaderError::Io(io::Error::new(io::ErrorKind::InvalidData, msg));
 
-    // Pass 1: scan to determine input_dim (max component + 1), without constructing the dataset.
-    let mut br = BufReader::new(File::open(path)?);
-    br.read_exact(&mut buffer_d)?;
-    let file_n_vecs = u32::from_le_bytes(buffer_d) as usize;
+    let mut word = [0_u8; 4];
+    br.read_exact(&mut word)?;
+    let file_n_vecs = u32::from_le_bytes(word) as usize;
     let n_vecs = limit.map_or(file_n_vecs, |n| n.min(file_n_vecs));
 
-    let mut max_component: Option<usize> = None;
+    // One pass straight into the CSR arrays, reserved from the file size (each
+    // non-zero takes 8 bytes after the header and the vector lengths) so that
+    // the multi-gigabyte arrays are never reallocated.
+    let file_nnz = file_len.saturating_sub(4 * (1 + file_n_vecs)) / 8;
+    let nnz_hint = if file_n_vecs == 0 {
+        0
+    } else {
+        (file_nnz as u128 * n_vecs as u128 / file_n_vecs as u128) as usize
+    };
+    let mut offsets = Vec::with_capacity(n_vecs + 1);
+    offsets.push(0);
+    let mut components: Vec<C> = Vec::with_capacity(nnz_hint);
+    let mut values: Vec<V> = Vec::with_capacity(nnz_hint);
+    let mut max_component: Option<u32> = None;
+    let mut bytes = Vec::new();
     for _ in 0..n_vecs {
-        br.read_exact(&mut buffer_d)?;
-        let n = u32::from_le_bytes(buffer_d) as usize;
+        br.read_exact(&mut word)?;
+        let n = u32::from_le_bytes(word) as usize;
+        bytes.resize(8 * n, 0);
+        br.read_exact(&mut bytes)?;
+        let (comp_bytes, value_bytes) = bytes.split_at(4 * n);
 
-        for _ in 0..n {
-            br.read_exact(&mut buffer_d)?;
-            let comp_val = u32::from_le_bytes(buffer_d) as usize;
-            max_component = Some(max_component.map_or(comp_val, |m| m.max(comp_val)));
+        let mut prev: Option<u32> = None;
+        for &c in comp_bytes.as_chunks::<4>().0 {
+            let c = u32::from_le_bytes(c);
+            if prev.is_some_and(|p| p >= c) {
+                return Err(invalid(format!(
+                    "components of vector {} are not strictly ascending",
+                    offsets.len() - 1
+                )));
+            }
+            prev = Some(c);
+            components.push(C::from_u32(c).ok_or_else(|| {
+                invalid(format!(
+                    "Component value {c} exceeds maximum for type (possible overflow)"
+                ))
+            })?);
         }
-
-        // Skip values (f32) for this vector.
-        for _ in 0..n {
-            br.read_exact(&mut buffer)?;
-        }
+        max_component = max_component.max(prev);
+        values.extend(
+            value_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&v| V::from_f32_saturating(f32::from_le_bytes(v))),
+        );
+        offsets.push(components.len());
     }
 
-    let input_dim = max_component.map_or(0, |m| m + 1);
-
-    // Pass 2: construct dataset and re-read, now that the dimensionality is known.
+    let input_dim = max_component.map_or(0, |m| m as usize + 1);
     let quantizer = PlainSparseQuantizer::<C, V, D>::new(input_dim, input_dim);
-    let mut data: PlainSparseDatasetGrowable<C, V, D> = DatasetGrowable::new(quantizer);
-
-    let mut br = BufReader::new(File::open(path)?);
-    br.read_exact(&mut buffer_d)?; // n_vecs header
-    let file_n_vecs_2 = u32::from_le_bytes(buffer_d) as usize;
-    if file_n_vecs_2 != file_n_vecs {
-        return Err(ReaderError::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Inconsistent header n_vecs between passes",
-        )));
-    }
-
-    use crate::core::vector::SparseVectorView; // Import View
-
-    for _ in 0..n_vecs {
-        br.read_exact(&mut buffer_d)?;
-        let n = u32::from_le_bytes(buffer_d) as usize;
-
-        let mut components = Vec::with_capacity(n);
-        let mut values = Vec::with_capacity(n);
-
-        // Read component indices
-        for _ in 0..n {
-            br.read_exact(&mut buffer_d)?;
-            let comp_val = u32::from_le_bytes(buffer_d);
-
-            // Check for overflow when converting u32 to C
-            let c = C::from_u32(comp_val).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "Component value {} exceeds maximum for type (possible overflow)",
-                        comp_val
-                    ),
-                )
-            })?;
-            components.push(c);
-        }
-
-        // Read component values
-        for _ in 0..n {
-            br.read_exact(&mut buffer)?;
-            let v = V::from_f32_saturating(f32::from_le_bytes(buffer));
-            values.push(v);
-        }
-
-        let sparse_vec = SparseVectorView::new(components.as_slice(), values.as_slice());
-        data.push(sparse_vec);
-    }
-
-    Ok(data.into())
+    Ok(PlainSparseDataset::from_parts(
+        offsets, components, values, quantizer,
+    ))
 }
 
 #[cfg(test)]
@@ -281,5 +264,88 @@ mod tests {
             read_seismic_format_limit::<u16, f32, DotProduct>(toy_seismic_path(), Some(1))?;
         assert_eq!(limited.len(), 1);
         Ok(())
+    }
+
+    /// Write `vectors` in the Seismic format to a fresh temporary file.
+    fn seismic_file(name: &str, vectors: &[(&[u32], &[f32])]) -> PathBuf {
+        let mut bytes = (vectors.len() as u32).to_le_bytes().to_vec();
+        for (components, values) in vectors {
+            bytes.extend((components.len() as u32).to_le_bytes());
+            components
+                .iter()
+                .for_each(|c| bytes.extend(c.to_le_bytes()));
+            values.iter().for_each(|v| bytes.extend(v.to_le_bytes()));
+        }
+        let path =
+            std::env::temp_dir().join(format!("vectorium_{}_{name}.bin", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn read_seismic_format_vectors_dim_and_limits() -> Result<(), ReaderError> {
+        let vectors: [(&[u32], &[f32]); 4] = [
+            (&[3, 7, 70_000], &[0.5, 1.5, 2.5]),
+            (&[], &[]),
+            (&[0], &[-1.0]),
+            (&[1, 2], &[4.0, 8.0]),
+        ];
+        let path = seismic_file("vectors", &vectors);
+        let dataset = read_seismic_format::<u32, f32, DotProduct>(&path)?;
+        assert_eq!(dataset.len(), 4);
+        assert_eq!(dataset.nnz(), 6);
+        assert_eq!(dataset.input_dim(), 70_001);
+        for (i, (components, values)) in vectors.iter().enumerate() {
+            let v = dataset.get(i as u64);
+            assert_eq!(v.components(), *components);
+            assert_eq!(v.values(), *values);
+        }
+        // The dimension comes from the vectors actually read.
+        let first_three = read_seismic_format_limit::<u32, f32, DotProduct>(&path, Some(3))?;
+        assert_eq!((first_three.len(), first_three.nnz()), (3, 4));
+        let more = read_seismic_format_limit::<u32, f32, DotProduct>(&path, Some(10))?;
+        assert_eq!(more.len(), 4);
+        let none = read_seismic_format_limit::<u32, f32, DotProduct>(&path, Some(0))?;
+        assert_eq!((none.len(), none.input_dim()), (0, 0));
+        std::fs::remove_file(path).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn read_seismic_format_empty_file() -> Result<(), ReaderError> {
+        let path = seismic_file("empty", &[]);
+        let dataset = read_seismic_format::<u32, f32, DotProduct>(&path)?;
+        assert_eq!(
+            (dataset.len(), dataset.nnz(), dataset.input_dim()),
+            (0, 0, 0)
+        );
+        std::fs::remove_file(path).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn read_seismic_format_rejects_bad_files() {
+        let overflow = seismic_file("overflow", &[(&[1, 70_000], &[1.0, 2.0])]);
+        let err = read_seismic_format::<u16, f32, DotProduct>(&overflow).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"), "{err}");
+
+        let unsorted = seismic_file("unsorted", &[(&[0], &[1.0]), (&[4, 2], &[1.0, 2.0])]);
+        let err = read_seismic_format::<u32, f32, DotProduct>(&unsorted).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("vector 1 are not strictly ascending"),
+            "{err}"
+        );
+        let duplicate = seismic_file("duplicate", &[(&[2, 2], &[1.0, 2.0])]);
+        assert!(read_seismic_format::<u32, f32, DotProduct>(&duplicate).is_err());
+
+        let truncated = seismic_file("truncated", &[(&[1, 2, 3], &[1.0, 2.0, 3.0])]);
+        let bytes = std::fs::read(&truncated).unwrap();
+        std::fs::write(&truncated, &bytes[..bytes.len() - 2]).unwrap();
+        assert!(read_seismic_format::<u32, f32, DotProduct>(&truncated).is_err());
+
+        for p in [overflow, unsorted, duplicate, truncated] {
+            std::fs::remove_file(p).unwrap();
+        }
     }
 }

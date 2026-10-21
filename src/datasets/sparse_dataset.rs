@@ -449,6 +449,30 @@ where
     }
 }
 
+impl<E> SparseDataset<E>
+where
+    E: SparseVectorEncoder,
+{
+    /// Builds a dataset from CSR arrays already in `encoder`'s output types, for
+    /// readers that produce them in bulk rather than pushing vector by vector.
+    /// The caller guarantees that `offsets` starts at `0`, is non-decreasing and
+    /// ends at the length of both `components` and `values`, and that every
+    /// vector's components are strictly ascending and below `encoder.input_dim()`.
+    pub(crate) fn from_parts(
+        offsets: Vec<usize>,
+        components: Vec<E::OutputComponentType>,
+        values: Vec<E::OutputValueType>,
+        encoder: E,
+    ) -> Self {
+        SparseDatasetGeneric {
+            storage: ImmutableSparseStorage::from(GrowableSparseStorage::from_parts(
+                offsets, components, values,
+            )),
+            encoder,
+        }
+    }
+}
+
 // Unfortunately, Rust doesn't yet support specialization, meaning that we can't use From too generically (otherwise it fails due to reimplementing `From<T> for T`)
 
 impl<E> From<SparseDatasetGrowable<E>> for SparseDataset<E>
