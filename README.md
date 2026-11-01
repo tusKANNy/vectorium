@@ -1,18 +1,23 @@
-# Vectorium
+<h1>
+    <img height="72" align="center" alt="" src="https://silviom97.github.io/assets/img/logos/vectorium.webp" />
+    &nbsp;&nbsp;&nbsp;Vectorium
+</h1>
 
-<p align="center">
-    <img width="300px" src="/imgs/vectorium_logo.png" />
-</p>
+Vectorium is the data layer for vector search in Rust: it stores, compresses and scores dense, sparse and
+multivector (ColBERT-style, optional feature) embeddings behind one dataset/encoder interface. An index
+written against it works with every encoding, from `f32` down to sub-bit codes, with no
+dynamic dispatch on the hot path. It is the data layer of [kANNolo](https://github.com/TusKANNy/kannolo),
+[Seismic](https://github.com/TusKANNy/seismic) and [TACHIOM](https://github.com/TusKANNy/tachiom).
 
-Vectorium is a Rust library for storing, accessing, and compressing dense and sparse embedding datasets.
-Multivector support (ColBERT-style late-interaction) is available as an optional feature.
-The main goal is to provide a unified dataset/encoder interface that can be shared by indexing/search crates such as
-[Seismic](https://github.com/TusKANNy/seismic) and [kANNolo](https://github.com/TusKANNy/kannolo).
+- **11 encoders, one contract:** `f16`/`bf16`, fixed point, Product Quantization, RaBitQ, and compressed
+  formats for learned sparse vectors. Switching encoders does not require any change in your index code.
+- **Validated against the references:** our PQ matches Faiss's accuracy, and our RaBitQ scan is 1.4–2.4×
+  faster than the authors' implementation.
+- **Portable fast kernels:** plain Rust that the compiler vectorizes for AVX2, AVX-512 or NEON.
 
-If you are new to KNN: *exhaustive* KNN searches score every vector in the dataset and return the top‑k closest results.
-That is accurate but slow at scale. ANN indexes (HNSW, IVF, Seismic, etc.) trade a bit of accuracy for speed by building extra data structures (e.g., proximity graphs, inverted indexes) on top of the same dataset/encoder primitives.
+It also ships an exact `FlatIndex`, k-means, and a CPU ground-truth tool.
 
-Vectorium includes an exhaustive search API (`FlatIndex`, which implements the `Index` trait over any dataset) and a binary executable for ground-truth computation on CPU. For state‑of‑the‑art dense, sparse and multivector indexing, use these tools: [Seismic](https://github.com/TusKANNy/seismic), [kANNolo](https://github.com/TusKANNy/kannolo), [TACHIOM](https://github.com/TusKANNy/tachiom).
+To reproduce the results of our papers, see [papers_reproducibility](https://github.com/tusKANNy/papers_reproducibility).
 
 ## Cargo features
 
@@ -262,7 +267,7 @@ assert_eq!((scalar16.len(), packed.len(), blocked.len()), (2, 2, 2));
   16 `(component, value)` pairs (64-byte blocks for `f16` and ScalarU16, 48-byte for ScalarU8); dot product only. Queries with fewer than `SPARSE_QUERY_THRESHOLD` (33) components are scored
   with **jump_dot**, which skips every block whose last component is smaller than the current query component and matches the
   rest with AVX2; longer queries are densified. Use it **when queries have few non-zero components** (short queries) and the
-  number of components fits in `u16` (at most 65,536). It requires x86_64 with AVX2/F16C/FMA (not checked at run time).
+  number of components fits in `u16` (at most 65,536). On x86_64 it requires AVX2/F16C/FMA (not checked at run time); other targets use a portable-SIMD path (NEON on aarch64).
 
 **Value types.**
 
