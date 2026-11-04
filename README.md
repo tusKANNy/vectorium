@@ -3,6 +3,10 @@
     &nbsp;&nbsp;&nbsp;Vectorium
 </h1>
 
+<p align="center">
+    <a href="https://arxiv.org/abs/2611.03927"><img src="https://badgen.net/static/arXiv/2611.03927/red" /></a>
+</p>
+
 Vectorium is the data layer for vector search in Rust: it stores, compresses and scores dense, sparse and
 multivector (ColBERT-style, optional feature) embeddings behind one dataset/encoder interface. An index
 written against it works with every encoding, from `f32` down to sub-bit codes, with no
@@ -17,7 +21,7 @@ dynamic dispatch on the hot path. It is the data layer of [kANNolo](https://gith
 
 It also ships an exact `FlatIndex`, k-means, and a CPU ground-truth tool.
 
-To reproduce the results of our papers, see [papers_reproducibility](https://github.com/tusKANNy/papers_reproducibility).
+Vectorium and kANNolo are described in our paper [*Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo*](https://arxiv.org/abs/2611.03927) ([citation](#citation)). To reproduce the results of our papers, see [papers_reproducibility](https://github.com/tusKANNy/papers_reproducibility).
 
 ## Cargo features
 
@@ -532,6 +536,22 @@ which costs throughput without buying a useful accuracy/footprint point.
   `SquaredEuclideanDistance` uses the natural ordering (smaller is better). Distance values must not be NaN.
 - **Range-based access:** `range_from_id`/`get_with_range` and `prefetch_with_range` are meant for index implementations that keep
   storage ranges around (especially for sparse/packed datasets) and want predictable, low-overhead access.
+
+## Citation
+
+If you use Vectorium in your work, please cite our paper (submitted to *Information Systems*):
+
+```bibtex
+@misc{martinico2026modularefficientapproximatenearest,
+      title={Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo},
+      author={Silvio Martinico and Franco Maria Nardini and Cosimo Rulli and Rossano Venturini},
+      year={2026},
+      eprint={2611.03927},
+      archivePrefix={arXiv},
+      primaryClass={cs.IR},
+      url={https://arxiv.org/abs/2611.03927},
+}
+```
 
 ## License
 
