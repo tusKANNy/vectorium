@@ -216,6 +216,31 @@ where
         SparseVectorOwned::new(components, values)
     }
 
+    fn lerp(&self, centroid: &mut Self::Vector, target: &Self::Vector, weight: f32) {
+        let (cc, cv) = (centroid.components(), centroid.values());
+        let (tc, tv) = (target.components(), target.values());
+        let mut components = Vec::with_capacity(cc.len() + tc.len());
+        let mut values = Vec::with_capacity(cc.len() + tc.len());
+        let (mut i, mut j) = (0, 0);
+        while i < cc.len() || j < tc.len() {
+            if j == tc.len() || (i < cc.len() && cc[i] < tc[j]) {
+                components.push(cc[i]);
+                values.push(cv[i] - weight * cv[i]);
+                i += 1;
+            } else if i == cc.len() || tc[j] < cc[i] {
+                components.push(tc[j]);
+                values.push(weight * tv[j]);
+                j += 1;
+            } else {
+                components.push(cc[i]);
+                values.push(cv[i] + weight * (tv[j] - cv[i]));
+                i += 1;
+                j += 1;
+            }
+        }
+        *centroid = SparseVectorOwned::new(components, values);
+    }
+
     /// The exact mean: its nonzeros are the union of the members' components.
     fn mean(&self, ids: &[u32], weights: Option<&[f32]>) -> Self::Vector {
         let mut entries: Vec<(E::InputComponentType, f32)> = Vec::new();
@@ -1173,6 +1198,18 @@ mod tests {
         let r = permutable_sparse().residual(0, &c);
         assert_eq!(r.components(), &[0, 1, 2, 5]);
         assert_eq!(r.values(), &[1.0, 1.0, 2.0, -2.0]);
+    }
+
+    #[test]
+    fn sparse_lerp_merges_components() {
+        use crate::core::dataset::MeanDataset;
+        use crate::core::vector::SparseVectorOwned;
+        // Centroid {1: 2.0, 3: 4.0}, target {0: 8.0, 3: 0.0}: the union, each moved halfway.
+        let mut c = SparseVectorOwned::new(vec![1_u16, 3], vec![2.0_f32, 4.0]);
+        let t = SparseVectorOwned::new(vec![0_u16, 3], vec![8.0_f32, 0.0]);
+        permutable_sparse().lerp(&mut c, &t, 0.5);
+        assert_eq!(c.components(), &[0, 1, 3]);
+        assert_eq!(c.values(), &[4.0, 1.0, 2.0]);
     }
 
     #[test]

@@ -19,7 +19,8 @@ dynamic dispatch on the hot path. It is the data layer of [kANNolo](https://gith
   faster than the authors' implementation.
 - **Portable fast kernels:** plain Rust that the compiler vectorizes for AVX2, AVX-512 or NEON.
 
-It also ships an exact `FlatIndex`, k-means, and a CPU ground-truth tool.
+It also ships an exact `FlatIndex`, two clustering algorithms behind one interface (Lloyd's k-means and
+mini-batch [e-means](#10-clustering-k-means-and-e-means)), and a CPU ground-truth tool.
 
 Vectorium and kANNolo are described in our paper [*Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo*](https://arxiv.org/abs/2611.03927) ([citation](#citation)). To reproduce the results of our papers, see [papers_reproducibility](https://github.com/tusKANNy/papers_reproducibility).
 
@@ -526,6 +527,55 @@ no `query_bits` dial. The intermediate widths
 which costs throughput without buying a useful accuracy/footprint point.
 
 
+### 10) Clustering: k-means and e-means
+
+`KMeans` (Lloyd) and `EMeans` (mini-batch k-means with an exponential moving average, ported from
+[faiss `contrib/e_means`](https://github.com/facebookresearch/faiss/tree/main/contrib/e_means)) implement
+one `Clustering` trait, so code generic over `Cl: Clustering` (product quantizers here, IVF in kANNolo)
+swaps one for the other; `ClusteringConfig` picks one at run time. Both cluster any dense or sparse
+dataset, write centroids into a growable dataset whose encoder fixes their precision and the clustering
+metric, and accept per-vector weights and a `refine` hook (e.g. `sparse_centroid_pruning`).
+
+E-means runs a fixed number of epochs (`nepochs`, default 5; an epoch is one sweep over the
+data), updating the centroids once per mini-batch rather than once per epoch as Lloyd's does. It
+picks the mini-batch size and step size from fitted scaling laws, so it needs no tuning. It typically
+matches Lloyd's quality in far less time; see Bessa et al., [*e-means: outperforming k-means (in
+one-tenth the epochs)*](https://arxiv.org/abs/2611.09501) ([citation](#citation)).
+
+```rust
+use vectorium::{
+    Clustering, ClusteringConfig, Dataset, EMeansBuilder, FlatIndex, IndexRefresh, KMeansBuilder,
+    PlainDenseDataset, PlainDenseDatasetGrowable, PlainDenseQuantizer, SquaredEuclideanDistance,
+};
+
+type Data = PlainDenseDataset<f32, SquaredEuclideanDistance>;
+type Centroids = PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance>;
+
+let (n, d, k) = (2_000, 8, 16);
+let values: Vec<f32> = (0..n * d).map(|i| ((i * 7919) % 1000) as f32 / 100.0).collect();
+let data = Data::from_raw(values.into_boxed_slice(), n, PlainDenseQuantizer::new(d));
+
+// Flat (exhaustive) assignment; the centroid encoder fixes precision and metric.
+let emeans = EMeansBuilder::new().nepochs(5.0).seed(Some(42)).build();
+let centroids: Centroids = emeans.train(&data, k, None, PlainDenseQuantizer::new(d));
+assert_eq!(centroids.len(), k);
+
+// Chosen at run time (e.g. from a CLI flag); the default is k-means.
+let config: ClusteringConfig = KMeansBuilder::new().n_iter(10).seed(Some(42)).into();
+let _: Centroids = config.train(&data, k, None, PlainDenseQuantizer::new(d));
+
+// Assignment through an index over the centroids (an HNSW or IVF when k is large). By default the
+// index is rebuilt for every update; `IndexRefresh` trades refreshes for exactly re-ranked candidates.
+let emeans = EMeansBuilder::new()
+    .seed(Some(42))
+    .index_refresh(IndexRefresh::every_updates(4).with_candidates(2))
+    .build();
+let _: Centroids = emeans.train_with_index(&data, k, None, PlainDenseQuantizer::new(d), FlatIndex::from, &());
+```
+
+Product quantizers take any algorithm too: `ProductQuantizer::train_with_clustering(&data, &emeans)`.
+
+
 ## Design notes
 
 - **Type safety by construction:** datasets are sealed and are tied to a specific encoder type, so mixing dense/sparse/packed
@@ -553,6 +603,23 @@ If you use Vectorium in your work, please cite our paper (submitted to *Informat
 }
 ```
 
+If you use `EMeans`, please also cite the e-means paper:
+
+```bibtex
+@misc{bessa2026emeans,
+  title  = {{e-means}: outperforming {k-means} (in one-tenth the epochs)},
+  author = {Bessa, Swann and Mazar{\'e}, Pierre-Emmanuel and Szilvasy, Gergely and
+            Touvron, Hugo and Picard, David and Douze, Matthijs and J{\'e}gou, Herv{\'e}},
+  year   = {2026},
+  note   = {Preprint},
+  url    = {https://arxiv.org/abs/2611.09501}
+}
+```
+
 ## License
 
 MIT. See `LICENSE-MIT`.
+
+`src/clustering/emeans.rs` is a port of the e-means implementation in
+[faiss `contrib/e_means`](https://github.com/facebookresearch/faiss/tree/main/contrib/e_means),
+Copyright (c) Meta Platforms, Inc. and affiliates, also MIT-licensed.

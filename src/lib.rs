@@ -53,7 +53,10 @@ pub use core::vector_encoder::{
     VectorEncoder, WithDistance,
 };
 
-pub use clustering::{KMeans, KMeansBuilder, sparse_centroid_pruning};
+pub use clustering::{
+    BatchLaw, CentroidIndexBuilder, Clustering, ClusteringConfig, EMeans, EMeansBuilder,
+    EMeansRecipe, IndexRefresh, KMeans, KMeansBuilder, RefreshEvery, sparse_centroid_pruning,
+};
 
 pub use core::data_block::{BLOCK_SIZE, Block, DataBlock, DataBlockU8, DataBlockU16};
 pub use encoders::blocked_sparse::{

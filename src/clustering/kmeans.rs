@@ -1,3 +1,4 @@
+use super::index_assign::{CentroidIndexBuilder, IndexRefresh, IndexedAssigner, UpdateCtx};
 use crate::Dataset;
 use crate::core::dataset::{DatasetGrowable, MeanDataset};
 use crate::core::distances::{Distance, dot_product_dense};
@@ -39,6 +40,7 @@ use std::time::Instant;
 /// `from_f32` rounding, so magnitudes above the type's finite max become `±inf` rather than
 /// clamping; callers must keep stored means inside the finite range of `C`. `FixedU8`/`FixedU16`
 /// are *unsigned*: every negative component clamps to `0`, so they destroy centred data.
+#[derive(Clone, Debug)]
 pub struct KMeans {
     n_iter: usize,
     n_redo: usize,
@@ -48,6 +50,10 @@ pub struct KMeans {
     seed: Option<u64>,
     /// Spherical k-means: L2-normalize each centroid after every update step.
     spherical: bool,
+    /// Return the last iteration's centroids instead of the best-objective iteration's.
+    keep_last: bool,
+    /// Centroid-index maintenance for [`train_with_index`](Self::train_with_index).
+    index_refresh: IndexRefresh,
 }
 
 impl KMeans {
@@ -70,7 +76,7 @@ impl KMeans {
     }
 
     /// Scale `values` to unit L2 norm in place; all-zero values stay zero.
-    fn normalize_l2(values: &mut [f32]) {
+    pub(crate) fn normalize_l2(values: &mut [f32]) {
         let norm: f32 = values.iter().map(|x| x * x).sum::<f32>().sqrt();
         // Take inverse of norm, take 0 if norm is 0
         let inv_norm = f32::from(norm > 0.0) * (1.0 / norm.max(f32::MIN_POSITIVE));
@@ -78,7 +84,7 @@ impl KMeans {
     }
 
     /// Store `means` in a fresh growable dataset with the given encoder.
-    fn to_dataset<M, G>(means: &[M], encoder: &G::Encoder) -> G
+    pub(crate) fn to_dataset<M, G>(means: &[M], encoder: &G::Encoder) -> G
     where
         G: DatasetGrowable,
         for<'a> &'a M: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
@@ -90,30 +96,36 @@ impl KMeans {
         centroids
     }
 
-    /// Run `assign` over the training vectors in parallel, with one decoded-query buffer per
-    /// rayon worker, overwritten per vector.
-    fn assign_each<D>(
+    /// Run `assign` over the training vectors `ids` (all of them when `None`) in parallel,
+    /// with one decoded-query buffer per rayon worker, overwritten per vector. Results are in
+    /// `ids` order.
+    pub(crate) fn assign_each<D>(
         dataset: &D,
+        ids: Option<&[u32]>,
         assign: impl Fn(&D::Vector) -> (f32, usize) + Sync,
     ) -> Vec<(f32, usize)>
     where
         D: MeanDataset + Sync,
     {
+        let run = |buffer: &mut Option<D::Vector>, i: u32| {
+            let query = match buffer {
+                Some(query) => {
+                    dataset.vector_into(i, query);
+                    query
+                }
+                None => buffer.insert(dataset.vector(i)),
+            };
+            assign(query)
+        };
+        if let Some(ids) = ids {
+            return ids
+                .par_iter()
+                .map_init(|| None::<D::Vector>, |buffer, &i| run(buffer, i))
+                .collect();
+        }
         (0..dataset.len() as u32)
             .into_par_iter()
-            .map_init(
-                || None::<D::Vector>,
-                |buffer, i| {
-                    let query = match buffer {
-                        Some(query) => {
-                            dataset.vector_into(i, query);
-                            query
-                        }
-                        None => buffer.insert(dataset.vector(i)),
-                    };
-                    assign(query)
-                },
-            )
+            .map_init(|| None::<D::Vector>, |buffer, i| run(buffer, i))
             .collect()
     }
 
@@ -129,8 +141,25 @@ impl KMeans {
         <C::Encoder as VectorEncoder>::Distance: Distance,
         for<'a> &'a D::Vector: Into<<C::Encoder as VectorEncoder>::QueryVector<'a>>,
     {
+        Self::compute_assignments_of(dataset, None, centroids)
+    }
+
+    /// [`compute_assignments`](Self::compute_assignments) restricted to the vectors `ids`
+    /// (all of them when `None`), in `ids` order.
+    pub(crate) fn compute_assignments_of<D, C>(
+        dataset: &D,
+        ids: Option<&[u32]>,
+        centroids: &C,
+    ) -> Vec<(f32, usize)>
+    where
+        D: MeanDataset + Sync,
+        C: Dataset + Sync,
+        C::Encoder: VectorEncoder<QueryParams = ()>,
+        <C::Encoder as VectorEncoder>::Distance: Distance,
+        for<'a> &'a D::Vector: Into<<C::Encoder as VectorEncoder>::QueryVector<'a>>,
+    {
         assert!(!centroids.is_empty(), "no centroids to assign to");
-        Self::assign_each(dataset, |query| {
+        Self::assign_each(dataset, ids, |query| {
             let evaluator = centroids.encoder().query_evaluator(query.into(), &());
             let best = centroids
                 .iter()
@@ -163,7 +192,7 @@ impl KMeans {
         Q::SearchParams: Sync,
         for<'a> &'a D::Vector: Into<Q::Query<'a>>,
     {
-        Self::assign_each(dataset, |query| {
+        Self::assign_each(dataset, None, |query| {
             let best = index
                 .search(query.into(), 1, search_params)
                 .into_iter()
@@ -323,14 +352,16 @@ impl KMeans {
             k,
             weights,
             centroid_encoder,
-            |centroids| Self::compute_assignments(training_dataset, centroids),
+            |centroids, _| Self::compute_assignments(training_dataset, centroids),
             refine,
         )
     }
 
-    /// Like [`train`](Self::train), but assigns through an [`Index`]: at each iteration
-    /// `build_centroid_index` builds an index over the current centroids and every training
-    /// vector takes its top-1 result there. The index's metric is the clustering metric.
+    /// Like [`train`](Self::train), but assigns through an [`Index`] over the centroids, built
+    /// by `build_centroid_index` (any `Fn(G) -> Q` works) and kept in step with them under this
+    /// configuration's [`IndexRefresh`] policy: by default it is rebuilt for every iteration.
+    /// Every vector takes the best of its top [`IndexRefresh::candidates`] results, re-ranked by
+    /// exact distance to the current centroids under `G`'s metric, which must be the index's.
     ///
     /// **Reproducibility caveat:** with a fixed [`KMeansBuilder::seed`], initialization and the
     /// update step are deterministic, but end-to-end reproducibility additionally requires the
@@ -341,16 +372,18 @@ impl KMeans {
         k: usize,
         weights: Option<Vec<f32>>,
         centroid_encoder: G::Encoder,
-        build_centroid_index: impl Fn(G) -> Q,
+        build_centroid_index: impl CentroidIndexBuilder<G, Index = Q>,
         search_params: &Q::SearchParams,
     ) -> G
     where
         D: MeanDataset + Sync,
-        G: DatasetGrowable + Clone,
-        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
+        G: DatasetGrowable + Clone + Sync,
+        G::Encoder: VectorEncoder<QueryParams = ()>,
+        <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>
+            + Into<<G::Encoder as VectorEncoder>::QueryVector<'a>>,
         Q: Index + Sync,
         Q::SearchParams: Sync,
-        Q::Distance: From<f32>,
         for<'a> &'a D::Vector: Into<Q::Query<'a>>,
     {
         self.train_with_index_refined(
@@ -373,43 +406,57 @@ impl KMeans {
         k: usize,
         weights: Option<Vec<f32>>,
         centroid_encoder: G::Encoder,
-        build_centroid_index: impl Fn(G) -> Q,
+        build_centroid_index: impl CentroidIndexBuilder<G, Index = Q>,
         search_params: &Q::SearchParams,
         refine: impl Fn(&[u32], &mut D::Vector) + Sync,
     ) -> G
     where
         D: MeanDataset + Sync,
-        G: DatasetGrowable + Clone,
-        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
+        G: DatasetGrowable + Clone + Sync,
+        G::Encoder: VectorEncoder<QueryParams = ()>,
+        <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
+        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>
+            + Into<<G::Encoder as VectorEncoder>::QueryVector<'a>>,
         Q: Index + Sync,
         Q::SearchParams: Sync,
-        Q::Distance: From<f32>,
         for<'a> &'a D::Vector: Into<Q::Query<'a>>,
     {
-        self.fit::<D, G, Q::Distance>(
+        let mut assigner = IndexedAssigner::new(build_centroid_index, self.index_refresh);
+        let centroids = self.fit::<D, G, <G::Encoder as VectorEncoder>::Distance>(
             training_dataset,
             k,
             weights,
             centroid_encoder,
-            |centroids| {
-                let index = build_centroid_index(centroids.clone());
-                Self::assign_with_index(training_dataset, &index, search_params)
+            |centroids, ctx| {
+                if ctx.update == 0 {
+                    // A new restart: its centroids are unrelated to the previous index.
+                    assigner.reset();
+                }
+                assigner.prepare(ctx, || centroids.clone());
+                assigner.assign(training_dataset, None, centroids, search_params)
             },
             refine,
-        )
+        );
+        if self.verbose {
+            println!(
+                "Centroid index: {} builds + {} refreshes, {:.2?} total",
+                assigner.builds, assigner.refreshes, assigner.maintenance_time
+            );
+        }
+        centroids
     }
 
     /// The k-means loop shared by [`train_refined`](Self::train_refined) and
-    /// [`train_with_index_refined`](Self::train_with_index_refined). `assign` maps the current centroids to one
-    /// `(distance, centroid)` per training vector, under metric `M`; `refine` is applied to every
-    /// updated centroid.
+    /// [`train_with_index_refined`](Self::train_with_index_refined). `assign` maps the current
+    /// centroids (and the iteration's position in the run) to one `(distance, centroid)` per
+    /// training vector, under metric `M`; `refine` is applied to every updated centroid.
     fn fit<D, G, M>(
         &self,
         training_dataset: &D,
         k: usize,
         weights: Option<Vec<f32>>,
         centroid_encoder: G::Encoder,
-        assign: impl Fn(&G) -> Vec<(f32, usize)>,
+        mut assign: impl FnMut(&G, UpdateCtx) -> Vec<(f32, usize)>,
         refine: impl Fn(&[u32], &mut D::Vector) + Sync,
     ) -> G
     where
@@ -470,10 +517,18 @@ impl KMeans {
 
             let mut average_imbalance_factor = 0.0;
             let mut total_splits = 0;
+            let mut split_last = false;
+            let mut last_obj: Option<M> = None;
 
             for i in 0..self.n_iter {
                 let t0 = Instant::now();
-                let assignments = assign(&centroids);
+                let ctx = UpdateCtx {
+                    update: i,
+                    epoch: i,
+                    epoch_start: true,
+                    centroids_jumped: split_last,
+                };
+                let assignments = assign(&centroids, ctx);
                 let assign_time = t0.elapsed();
 
                 let t0 = Instant::now();
@@ -494,9 +549,11 @@ impl KMeans {
 
                 average_imbalance_factor += imbalance_factor;
                 total_splits += n_split;
+                split_last = n_split > 0;
 
                 let obj = M::from(obj);
-                if best_obj.is_none_or(|best| obj < best) {
+                last_obj = Some(obj);
+                if !self.keep_last && best_obj.is_none_or(|best| obj < best) {
                     if self.verbose {
                         println!("New best objective: {} (keep new clusters)", obj.distance());
                     }
@@ -507,11 +564,19 @@ impl KMeans {
 
                 if self.verbose {
                     println!(
-                        "Iteration {i}, imbalance: {imbalance_factor:.4}, splits: {n_split}, \
+                        "Iteration {i}, objective: {}, imbalance: {imbalance_factor:.4}, splits: {n_split}, \
                          centroid nnz: {}, assign: {assign_time:.2?}, split: {split_time:.2?}",
+                        obj.distance(),
                         centroids.nnz()
                     );
                 }
+            }
+
+            // `keep_last`: each restart contributes its final centroids, and restarts compete on
+            // their last iteration's objective.
+            if self.keep_last && last_obj.is_some_and(|o| best_obj.is_none_or(|best| o < best)) {
+                best_obj = last_obj;
+                best_centroids = centroids.clone();
             }
 
             if self.verbose {
@@ -526,6 +591,7 @@ impl KMeans {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct KMeansBuilder {
     n_iter: usize,
     n_redo: usize,
@@ -533,6 +599,8 @@ pub struct KMeansBuilder {
     max_points_per_centroid: usize,
     seed: Option<u64>,
     spherical: bool,
+    keep_last: bool,
+    index_refresh: IndexRefresh,
 }
 
 impl Default for KMeansBuilder {
@@ -544,6 +612,8 @@ impl Default for KMeansBuilder {
             max_points_per_centroid: 256,
             seed: None,
             spherical: false,
+            keep_last: false,
+            index_refresh: IndexRefresh::default(),
         }
     }
 }
@@ -597,6 +667,23 @@ impl KMeansBuilder {
         self
     }
 
+    /// Return the last iteration's centroids (per restart) instead of those of the iteration with
+    /// the best objective (the default). Under a dot-product metric the objective rewards
+    /// centroid norm rather than partition quality, and with sparse pruning it can peak at the
+    /// first iteration, so "best" would discard every later iteration.
+    pub fn keep_last(mut self, keep_last: bool) -> KMeansBuilder {
+        self.keep_last = keep_last;
+        self
+    }
+
+    /// Centroid-index maintenance for [`KMeans::train_with_index`]: how often the index is
+    /// refreshed (every `n` iterations) and how many of its results are re-ranked exactly.
+    /// Default: refresh every iteration, top result only.
+    pub fn index_refresh(mut self, index_refresh: IndexRefresh) -> KMeansBuilder {
+        self.index_refresh = index_refresh;
+        self
+    }
+
     pub fn build(self) -> KMeans {
         KMeans {
             n_iter: self.n_iter,
@@ -604,6 +691,8 @@ impl KMeansBuilder {
             verbose: self.verbose,
             seed: self.seed,
             spherical: self.spherical,
+            keep_last: self.keep_last,
+            index_refresh: self.index_refresh,
         }
     }
 }
@@ -681,6 +770,34 @@ mod tests {
     type Centroids<V> = PlainDenseDataset<V, SquaredEuclideanDistance>;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+
+    #[test]
+    fn keep_last_returns_final_iteration() {
+        // With one restart, keep_last's result is the n_iter-th update, which is the same as
+        // running only that many iterations under keep_last; and it differs from n_iter = 1.
+        let encoder = PlainDenseQuantizer::<f32, SquaredEuclideanDistance>::new(2);
+        let mut b = PlainDenseDatasetGrowable::new(encoder.clone());
+        let mut rng = StdRng::seed_from_u64(1);
+        for _ in 0..500 {
+            b.push(DenseVectorView::new(&[
+                rng.gen_range(0.0f32..10.0),
+                rng.gen_range(0.0f32..10.0),
+            ]));
+        }
+        let ds: PlainDenseDataset<f32, SquaredEuclideanDistance> = b.into();
+        let run = |n_iter: usize| -> Vec<f32> {
+            let km = KMeansBuilder::new()
+                .n_iter(n_iter)
+                .seed(Some(3))
+                .keep_last(true)
+                .build();
+            let c: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> =
+                km.train(&ds, 8, None, PlainDenseQuantizer::new(2));
+            c.values().to_vec()
+        };
+        assert_eq!(run(6), run(6));
+        assert_ne!(run(6), run(1));
+    }
 
     #[test]
     fn compute_assignments_picks_nearest_centroid() {

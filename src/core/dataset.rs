@@ -268,6 +268,13 @@ pub trait MeanDataset: Dataset {
     /// input space (e.g. a [`mean`](Self::mean)). For a sparse dataset its nonzeros are the
     /// union of the two vectors' components.
     fn residual(&self, id: u32, centroid: &Self::Vector) -> Self::Vector;
+
+    /// Moves `centroid` a fraction `weight` of the way towards `target`, in place:
+    /// `centroid ← centroid + weight · (target − centroid)`. Both are vectors of this
+    /// dataset's input space; for a sparse dataset the result's nonzeros are the union of the
+    /// two vectors' components. This is the exponential-moving-average step of mini-batch
+    /// clustering ([`EMeans`](crate::clustering::EMeans)).
+    fn lerp(&self, centroid: &mut Self::Vector, target: &Self::Vector, weight: f32);
 }
 
 /// Marker trait representing any dataset whose encoder exposes the dense-vector contract.
