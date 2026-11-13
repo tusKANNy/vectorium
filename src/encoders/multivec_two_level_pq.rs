@@ -325,7 +325,10 @@ impl<const M: usize, In> MultiVecTwoLevelProductQuantizer<M, In> {
     where
         In: ValueType,
     {
-        let kmeans = KMeansBuilder::new().n_iter(n_iter).seed(seed).build();
+        let kmeans = KMeansBuilder::new()
+            .epochs(n_iter as f64)
+            .seed(seed)
+            .build();
         Self::train_from_coarse_with_kmeans(
             coarse_centroids,
             flat_input,

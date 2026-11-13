@@ -12,7 +12,8 @@
 //!
 //! # Algorithm
 //!
-//! Training makes a fixed budget of `nepochs` epochs over the data (no convergence test).
+//! Training makes a fixed budget of epochs over the data (no convergence test): the
+//! [`KMeans`] epoch budget, 2 by default for e-means (faiss defaults to 5).
 //! Each epoch visits the vectors in a fresh random order, in mini-batches of `B`. For each
 //! batch, vectors are assigned to their nearest centroid against a fixed snapshot of the
 //! centroids, and every centroid `j` touched by the batch (batch count `n_j`, batch mean
@@ -253,11 +254,11 @@ fn scheduled_alpha(alpha0: f64, step: usize, total_steps: usize) -> f64 {
 }
 
 /// Parameters of the e-means solver ([`Solver::EMeans`](super::Solver::EMeans)). Every option
-/// defaults to the faiss `NumpyEmeans` default.
+/// defaults to the faiss `NumpyEmeans` default. The epoch budget is not here: it belongs to
+/// [`KMeans`] ([`KMeansBuilder::epochs`](super::KMeansBuilder::epochs)), which defaults to 2
+/// epochs for e-means where faiss uses 5.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EMeansParams {
-    /// Epoch budget `T` (default 5). Fractional values add a partial epoch.
-    pub nepochs: f64,
     /// Fixes the batch size `B` instead of using the batch law. The step law still sets
     /// `alpha0` for this `B` unless `alpha0` is also given.
     pub batch_size: Option<usize>,
@@ -273,7 +274,6 @@ pub struct EMeansParams {
 impl Default for EMeansParams {
     fn default() -> Self {
         Self {
-            nepochs: 5.0,
             batch_size: None,
             alpha0: None,
             batch_law: BatchLaw::Auto,
@@ -283,14 +283,15 @@ impl Default for EMeansParams {
 }
 
 impl EMeansParams {
-    /// The recipe these parameters resolve to for `n` vectors of dimension `d` and `k`
-    /// clusters. Training uses exactly this recipe.
-    pub fn recipe(&self, n: usize, k: usize, d: usize) -> EMeansRecipe {
+    /// The recipe these parameters resolve to for `n` vectors of dimension `d`, `k` clusters
+    /// and an epoch budget of `nepochs` ([`KMeans::epochs`]). Training uses exactly this
+    /// recipe.
+    pub fn recipe(&self, n: usize, k: usize, d: usize, nepochs: f64) -> EMeansRecipe {
         EMeansRecipe::resolve(
             n,
             k,
             d,
-            self.nepochs,
+            nepochs,
             self.batch_law,
             self.batch_size,
             self.alpha0,
@@ -313,14 +314,14 @@ where
 {
     let dataset = run.dataset;
     let (n, k) = (dataset.len(), run.k);
-    let recipe = params.recipe(n, k, dataset.input_dim());
+    let recipe = params.recipe(n, k, dataset.input_dim(), run.epochs);
     let seed = run.seed;
 
     if run.verbose {
         println!(
             "E-means: {} epochs (batch {}, alpha0 {:.4}, {} updates, law {:?}, tau {}). \
              Please cite Bessa et al., arXiv:2611.09501.",
-            params.nepochs,
+            run.epochs,
             recipe.batch_size,
             recipe.alpha0,
             recipe.total_steps,
@@ -414,12 +415,14 @@ where
         if run.verbose {
             println!(
                 "  Epoch {}/{n_passes} ({rows} rows, {} updates, {:.2?}): objective={objective:.6e} \
-                 imbalance={:.4} splits={} assign={assign_time:.2?} update={update_time:.2?}",
+                 imbalance={:.4} splits={} centroid nnz={} assign={assign_time:.2?} \
+                 update={update_time:.2?}",
                 epoch + 1,
                 recipe.epoch_steps[epoch],
                 start.elapsed(),
                 imbalance_factor(pass_counts.iter().copied()),
                 n_splits - splits_before,
+                run.to_dataset(&centroids).nnz(),
             );
         }
     }
@@ -446,7 +449,11 @@ where
             }
         });
     run.normalize_if_spherical(&mut centroids);
-    run.to_dataset(&centroids)
+    let centroids = run.to_dataset(&centroids);
+    if run.verbose {
+        println!("  Closing means: centroid nnz={}", centroids.nnz());
+    }
+    centroids
 }
 
 /// Applies one batch's EMA update (Algorithm 1, line 8) to `centroids` and `usage`, refines
@@ -598,8 +605,12 @@ mod tests {
     }
 
     /// A k-means builder with the e-means solver and these parameters.
+    /// A k-means builder with this e-means solver and the 5-epoch budget these tests were
+    /// written for (faiss's default; vectorium's is 2).
     fn emeans_with(params: EMeansParams) -> KMeansBuilder {
-        KMeansBuilder::new().solver(Solver::EMeans(params))
+        KMeansBuilder::new()
+            .solver(Solver::EMeans(params))
+            .epochs(5.0)
     }
 
     /// A k-means builder with the default e-means solver.
@@ -611,7 +622,7 @@ mod tests {
 
     #[test]
     fn recipe_matches_faiss_readme_example() {
-        // README: NumpyEmeans(d=64, k=500) on n=200_000 with the default 5 epochs.
+        // README: NumpyEmeans(d=64, k=500) on n=200_000 with faiss's default 5 epochs.
         // raw B = 0.035134 * 500^0.1347 * 200000^0.8765 * 5^0.8133 ~= 13_332 -> 16_384;
         // the step law gives ~1.014, clamped to 1.
         let r = EMeansRecipe::resolve(200_000, 500, 64, 5.0, BatchLaw::Auto, None, None, None);
@@ -881,12 +892,10 @@ mod tests {
     #[test]
     fn train_is_deterministic_for_a_seed_and_across_thread_counts() {
         let (ds, _) = blobs(5, 400, 24, 11);
-        let em = emeans_with(EMeansParams {
-            nepochs: 2.5,
-            ..Default::default()
-        })
-        .seed(Some(42))
-        .build();
+        let em = emeans_with(EMeansParams::default())
+            .epochs(2.5)
+            .seed(Some(42))
+            .build();
         let run = |threads: usize| -> Grow {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -1024,7 +1033,7 @@ mod tests {
         assert!(c.values().chunks_exact(6).all(|r| r[5] == 0.0));
     }
 
-    /// E-means at its default 5 epochs should land close to (typically below) Lloyd's
+    /// E-means at 5 epochs (faiss's default) should land close to (typically below) Lloyd's
     /// objective at 10 iterations on overlapping clusters.
     #[test]
     fn objective_is_competitive_with_lloyd() {
@@ -1035,12 +1044,11 @@ mod tests {
             .map(|i| centers[((i / d) % 50) * d + i % d] + rng.gen_range(-1.0f32..1.0))
             .collect();
         let ds = Plain::from_raw(values.into_boxed_slice(), n, enc(d));
-        let lloyd: Grow =
-            KMeansBuilder::new()
-                .n_iter(10)
-                .seed(Some(1))
-                .build()
-                .train(&ds, k, None, enc(d));
+        let lloyd: Grow = KMeansBuilder::new()
+            .epochs(10.0)
+            .seed(Some(1))
+            .build()
+            .train(&ds, k, None, enc(d));
         let em: Grow = emeans().seed(Some(1)).build().train(&ds, k, None, enc(d));
         let (ol, oe) = (objective(&ds, &lloyd), objective(&ds, &em));
         assert!(oe <= 1.03 * ol, "e-means objective {oe} vs Lloyd {ol}");

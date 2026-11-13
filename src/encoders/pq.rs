@@ -95,7 +95,10 @@ where
         n_iter: usize,
         seed: Option<u64>,
     ) -> Self {
-        let kmeans = KMeansBuilder::new().n_iter(n_iter).seed(seed).build();
+        let kmeans = KMeansBuilder::new()
+            .epochs(n_iter as f64)
+            .seed(seed)
+            .build();
         Self::train_with_kmeans(training_data, &kmeans)
     }
 

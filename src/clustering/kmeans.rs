@@ -1,6 +1,6 @@
 use super::emeans::{self, EMeansParams};
 use super::index_assign::{CentroidIndexBuilder, IndexRefresh, IndexedAssigner, UpdateCtx};
-use super::lloyd::{self, LloydParams};
+use super::lloyd;
 use crate::Dataset;
 use crate::core::dataset::{DatasetGrowable, MeanDataset};
 use crate::core::distances::Distance;
@@ -33,12 +33,22 @@ use rayon::prelude::*;
 /// `KMeans` is the k-means problem (choose `k` centroids minimising the distance of every
 /// vector to its nearest one) together with everything every way of solving it shares:
 /// initialisation from `k` distinct training vectors, flat or index-accelerated assignment,
-/// weights, the `refine` hook, spherical mode, seeding and the conversion to `G`. How the
-/// centroids are fitted is the [`Solver`], chosen with [`KMeansBuilder::solver`]:
+/// weights, the `refine` hook, spherical mode, seeding, restarts, the epoch budget and the
+/// conversion to `G`. How the centroids are fitted is the [`Solver`], chosen with
+/// [`KMeansBuilder::solver`]:
 /// - [`Solver::Lloyd`] (the default): Lloyd's algorithm, a full pass and an exact mean update
-///   per iteration ([`LloydParams`]).
+///   per iteration.
 /// - [`Solver::EMeans`]: e-means, mini-batch updates with an exponential moving average and
 ///   fitted scaling laws, ported from faiss ([`EMeansParams`]).
+///
+/// # Epoch budget
+///
+/// Training runs for a fixed budget of epochs ([`KMeansBuilder::epochs`]), where an epoch
+/// assigns every training vector once. Both solvers spend about the same time per epoch, so
+/// the budget fixes the cost and the solver decides how to spend it: Lloyd makes one update
+/// per epoch, e-means one per mini-batch. Unset, each solver uses its own default
+/// ([`Solver::default_epochs`]): 10 for Lloyd and 2 for e-means. (faiss's e-means defaults to
+/// 5 epochs; 2 already matches or beats Lloyd at 10 in our benchmarks.)
 ///
 /// # Precision of dense centroids
 ///
@@ -55,6 +65,10 @@ use rayon::prelude::*;
 #[derive(Clone, Debug)]
 pub struct KMeans {
     solver: Solver,
+    /// Epoch budget; `None` uses the solver's default.
+    epochs: Option<f64>,
+    /// Independent restarts; the best final objective wins.
+    n_redo: usize,
     verbose: bool,
     /// Optional fixed seed for the RNG.  `None` = drawn from entropy (non-deterministic).
     /// Setting a seed makes clustering fully reproducible across runs and thread counts.
@@ -68,20 +82,27 @@ pub struct KMeans {
 /// How [`KMeans`] fits its centroids. Both solvers optimise the same objective; they differ in
 /// the row schedule, the update rule, the handling of empty clusters and which centroids they
 /// return.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum Solver {
-    /// Lloyd's algorithm: every iteration assigns all vectors, then replaces each centroid by
-    /// the mean of its members and splits empty clusters.
-    Lloyd(LloydParams),
+    /// Lloyd's algorithm: every iteration (one epoch) assigns all vectors, then replaces each
+    /// centroid by the mean of its members and splits empty clusters. Needs a whole number of
+    /// epochs.
+    #[default]
+    Lloyd,
     /// E-means (Bessa et al., arXiv:2611.09501, ported from faiss `contrib/e_means`):
     /// mini-batches over permuted epochs, an exponential-moving-average update, mass-based
     /// revival of starved clusters and exact closing means.
     EMeans(EMeansParams),
 }
 
-impl Default for Solver {
-    fn default() -> Self {
-        Solver::Lloyd(LloydParams::default())
+impl Solver {
+    /// The epoch budget used when [`KMeansBuilder::epochs`] is not set: 10 for Lloyd, 2 for
+    /// e-means.
+    pub fn default_epochs(&self) -> f64 {
+        match self {
+            Solver::Lloyd => 10.0,
+            Solver::EMeans(_) => 2.0,
+        }
     }
 }
 
@@ -96,7 +117,9 @@ pub(super) struct Run<'a, D: MeanDataset, G: DatasetGrowable> {
     pub k: usize,
     pub weights: Option<&'a [f32]>,
     pub encoder: &'a G::Encoder,
-    /// The resolved seed: the configured one, or one drawn from entropy.
+    /// The resolved epoch budget (validated for the solver).
+    pub epochs: f64,
+    /// This restart's seed: derived from the configured one, or from one drawn from entropy.
     pub seed: u64,
     pub spherical: bool,
     pub verbose: bool,
@@ -309,6 +332,16 @@ impl KMeans {
         &self.solver
     }
 
+    /// The epoch budget: the configured one, or the solver's default.
+    pub fn epochs(&self) -> f64 {
+        self.epochs.unwrap_or_else(|| self.solver.default_epochs())
+    }
+
+    /// The number of independent restarts.
+    pub fn n_redo(&self) -> usize {
+        self.n_redo
+    }
+
     /// Flat assignment: for each vector, its nearest centroid by exhaustive scan of `centroids`
     /// under the centroids' own metric.
     ///
@@ -356,9 +389,10 @@ impl KMeans {
     /// assigned to its nearest centroid under `G`'s metric (see [`KMeans`]). With `weights`,
     /// centroids are weighted means.
     ///
-    /// Which centroids are returned is up to the [`Solver`] (see [`LloydParams`] and
-    /// [`EMeansParams`]). With a fixed [`KMeansBuilder::seed`] the result is deterministic
-    /// across runs and thread counts.
+    /// Each restart returns its solver's final centroids; with several restarts
+    /// ([`KMeansBuilder::n_redo`]), the one whose final centroids have the best objective wins.
+    /// With a fixed [`KMeansBuilder::seed`] the result is deterministic across runs and thread
+    /// counts.
     pub fn train<D, G>(
         &self,
         training_dataset: &D,
@@ -544,35 +578,71 @@ impl KMeans {
                 "weights must have one entry per training vector"
             );
         }
-        let run = Run::<D, G> {
-            dataset: training_dataset,
-            k,
-            weights: weights.as_deref(),
-            encoder: centroid_encoder,
-            seed: self.seed.unwrap_or_else(|| rand::thread_rng().r#gen()),
-            spherical: self.spherical,
-            verbose: self.verbose,
-        };
+        let epochs = self.epochs();
+        let base_seed = self.seed.unwrap_or_else(|| rand::thread_rng().r#gen());
+        let n_redo = self.n_redo.max(1);
         if self.verbose {
             println!(
-                "Clustering {n} points ({} nnz, dim {}) to {k} clusters{}",
+                "Clustering {n} points ({} nnz, dim {}) to {k} clusters{}, {epochs} epochs, \
+                 {n_redo} restart(s)",
                 training_dataset.nnz(),
                 training_dataset.input_dim(),
                 if self.spherical { ", spherical" } else { "" },
             );
         }
-        match &self.solver {
-            Solver::Lloyd(params) => lloyd::fit::<D, G, <G::Encoder as VectorEncoder>::Distance>(
-                &run, params, assign, refine,
-            ),
-            Solver::EMeans(params) => emeans::fit(&run, params, assign, refine),
+        let mut best: Option<(<G::Encoder as VectorEncoder>::Distance, G)> = None;
+        for redo in 0..n_redo {
+            let run = Run::<D, G> {
+                dataset: training_dataset,
+                k,
+                weights: weights.as_deref(),
+                encoder: centroid_encoder,
+                epochs,
+                // Restart `r` runs with seed `s + r`: restarts differ within a run, and restart 0
+                // is the single-restart run.
+                seed: base_seed.wrapping_add(redo as u64),
+                spherical: self.spherical,
+                verbose: self.verbose,
+            };
+            let centroids = match &self.solver {
+                Solver::Lloyd => lloyd::fit(&run, assign, refine),
+                Solver::EMeans(params) => emeans::fit(&run, params, assign, refine),
+            };
+            if n_redo == 1 {
+                return centroids;
+            }
+            // Score this restart's final centroids with one more assignment pass, so restarts
+            // are compared on the centroids they actually return. `centroids_jumped` forces a
+            // centroid index, if any, to refresh over exactly these centroids; a nonzero
+            // `update` keeps it from being reset as if a new run had started.
+            let ctx = UpdateCtx {
+                update: usize::MAX,
+                epoch: usize::MAX,
+                epoch_start: true,
+                centroids_jumped: true,
+            };
+            let obj = <G::Encoder as VectorEncoder>::Distance::from(
+                assign(&centroids, ctx, None)
+                    .iter()
+                    .map(|&(v, _)| v)
+                    .sum::<f32>(),
+            );
+            if self.verbose {
+                println!("Restart {redo} final objective: {}", obj.distance());
+            }
+            if best.as_ref().is_none_or(|(b, _)| obj < *b) {
+                best = Some((obj, centroids));
+            }
         }
+        best.expect("at least one restart").1
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct KMeansBuilder {
     solver: Solver,
+    epochs: Option<f64>,
+    n_redo: usize,
     verbose: bool,
     max_points_per_centroid: usize,
     seed: Option<u64>,
@@ -584,6 +654,8 @@ impl Default for KMeansBuilder {
     fn default() -> Self {
         KMeansBuilder {
             solver: Solver::default(),
+            epochs: None,
+            n_redo: 1,
             verbose: false,
             max_points_per_centroid: 256,
             seed: None,
@@ -598,35 +670,27 @@ impl KMeansBuilder {
         KMeansBuilder::default()
     }
 
-    /// The solver that fits the centroids (default: [`Solver::Lloyd`] with
-    /// [`LloydParams::default`]).
+    /// The solver that fits the centroids (default: [`Solver::Lloyd`]). Independent of
+    /// [`epochs`](Self::epochs) and [`n_redo`](Self::n_redo), which apply to any solver.
     pub fn solver(mut self, solver: Solver) -> KMeansBuilder {
         self.solver = solver;
         self
     }
 
-    /// Shorthand for the Lloyd solver's [`LloydParams::n_iter`]. Selects [`Solver::Lloyd`]
-    /// (with default parameters otherwise) if another solver was set.
-    pub fn n_iter(mut self, n_iter: usize) -> KMeansBuilder {
-        self.lloyd_params().n_iter = n_iter;
+    /// The epoch budget: how many times training assigns every vector (see [`KMeans`]).
+    /// Unset, the solver's default is used ([`Solver::default_epochs`]: 10 for Lloyd, 2 for
+    /// e-means). E-means accepts fractional budgets; Lloyd needs a whole number, and
+    /// [`build`](Self::build) panics otherwise.
+    pub fn epochs(mut self, epochs: f64) -> KMeansBuilder {
+        self.epochs = Some(epochs);
         self
     }
 
-    /// Shorthand for the Lloyd solver's [`LloydParams::n_redo`]. Selects [`Solver::Lloyd`]
-    /// (with default parameters otherwise) if another solver was set.
+    /// Independent restarts from different initial centroids (default 1). Each restart's final
+    /// centroids are scored with one extra assignment pass, and the best is returned.
     pub fn n_redo(mut self, n_redo: usize) -> KMeansBuilder {
-        self.lloyd_params().n_redo = n_redo;
+        self.n_redo = n_redo;
         self
-    }
-
-    fn lloyd_params(&mut self) -> &mut LloydParams {
-        if !matches!(self.solver, Solver::Lloyd(_)) {
-            self.solver = Solver::Lloyd(LloydParams::default());
-        }
-        match &mut self.solver {
-            Solver::Lloyd(params) => params,
-            Solver::EMeans(_) => unreachable!(),
-        }
     }
 
     pub fn verbose(mut self, verbose: bool) -> KMeansBuilder {
@@ -666,16 +730,36 @@ impl KMeansBuilder {
     }
 
     /// Centroid-index maintenance for [`KMeans::train_with_index`]: how often the index is
-    /// refreshed (in updates or epochs) and how many of its results are re-ranked exactly.
-    /// Default: refresh every update, top result only.
+    /// refreshed, in updates or epochs. Default: refresh every update.
     pub fn index_refresh(mut self, index_refresh: IndexRefresh) -> KMeansBuilder {
         self.index_refresh = index_refresh;
         self
     }
 
+    /// Builds the configuration.
+    ///
+    /// # Panics
+    ///
+    /// If [`epochs`](Self::epochs) is not finite and positive, or is not a whole number for
+    /// [`Solver::Lloyd`].
     pub fn build(self) -> KMeans {
+        if let Some(epochs) = self.epochs {
+            assert!(
+                epochs.is_finite() && epochs > 0.0,
+                "k-means epochs must be finite and positive (got {epochs})"
+            );
+            if self.solver == Solver::Lloyd {
+                assert!(
+                    epochs.fract() == 0.0,
+                    "Lloyd's algorithm runs whole epochs (one per iteration); got {epochs}. \
+                     Fractional budgets are for Solver::EMeans."
+                );
+            }
+        }
         KMeans {
             solver: self.solver,
+            epochs: self.epochs,
+            n_redo: self.n_redo,
             verbose: self.verbose,
             seed: self.seed,
             spherical: self.spherical,
@@ -781,22 +865,42 @@ mod tests {
         assert_eq!(imbalance_factor([10.0, 0.0].into_iter()), 2.0);
     }
 
+    /// `epochs` and `n_redo` belong to `KMeans`: they never change the solver, in any call
+    /// order, and an unset budget falls back to the solver's default.
     #[test]
-    fn n_iter_and_n_redo_select_lloyd() {
+    fn epochs_and_n_redo_are_solver_independent() {
         use super::super::emeans::EMeansParams;
-        let km = KMeansBuilder::new()
-            .solver(Solver::EMeans(EMeansParams::default()))
-            .n_iter(3)
+        let em = Solver::EMeans(EMeansParams::default());
+        let a = KMeansBuilder::new()
+            .solver(em.clone())
+            .epochs(3.5)
             .n_redo(2)
             .build();
-        assert_eq!(
-            km.solver(),
-            &Solver::Lloyd(LloydParams {
-                n_iter: 3,
-                n_redo: 2
-            })
-        );
-        assert_eq!(KMeansBuilder::new().build().solver(), &Solver::default());
+        let b = KMeansBuilder::new()
+            .epochs(3.5)
+            .n_redo(2)
+            .solver(em.clone())
+            .build();
+        for km in [&a, &b] {
+            assert_eq!(km.solver(), &em);
+            assert_eq!((km.epochs(), km.n_redo()), (3.5, 2));
+        }
+        assert_eq!(KMeansBuilder::new().build().solver(), &Solver::Lloyd);
+        assert_eq!(KMeansBuilder::new().build().epochs(), 10.0);
+        assert_eq!(KMeansBuilder::new().solver(em).build().epochs(), 2.0);
+        assert_eq!(KMeansBuilder::new().epochs(4.0).build().epochs(), 4.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "whole epochs")]
+    fn lloyd_rejects_fractional_epochs() {
+        KMeansBuilder::new().epochs(2.5).build();
+    }
+
+    #[test]
+    #[should_panic(expected = "finite and positive")]
+    fn zero_epochs_are_rejected() {
+        KMeansBuilder::new().epochs(0.0).build();
     }
 
     #[test]
@@ -835,7 +939,7 @@ mod tests {
         dataset_builder.push(DenseVectorView::new(&[10.0f32, 10.0]));
 
         let dataset: PlainDenseDataset<f32, SquaredEuclideanDistance> = dataset_builder.into();
-        let kmeans = KMeansBuilder::new().n_iter(5).n_redo(2).build();
+        let kmeans = KMeansBuilder::new().epochs(5.0).n_redo(2).build();
         let centroids: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> =
             kmeans.train(&dataset, 2, None, PlainDenseQuantizer::new(2));
 
@@ -890,7 +994,7 @@ mod tests {
         let dataset: Centroids<T> = builder.into();
 
         let kmeans = KMeansBuilder::new()
-            .n_iter(10)
+            .epochs(10.0)
             .n_redo(3)
             .seed(Some(42))
             .build();
@@ -1000,7 +1104,7 @@ mod tests {
         let dataset = sparse_dataset(&refs, 20);
 
         let kmeans = KMeansBuilder::new()
-            .n_iter(10)
+            .epochs(10.0)
             .n_redo(3)
             .seed(Some(42))
             .spherical(true)
@@ -1051,7 +1155,7 @@ mod tests {
                 entries.iter().map(|e| e.1).collect(),
             );
         };
-        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42)).build();
+        let kmeans = KMeansBuilder::new().epochs(5.0).seed(Some(42)).build();
         let centroids: PlainSparseDatasetGrowable<u16, f32, DotProduct> =
             kmeans.train_refined(&dataset, 2, None, PlainSparseQuantizer::new(20, 20), top2);
 
@@ -1081,7 +1185,7 @@ mod tests {
         let dataset = sparse_dataset(&refs, 20);
 
         // Every vector has 5 nonzeros, so factor 0.5 allows ⌈2.5⌉ = 3 per centroid.
-        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42)).build();
+        let kmeans = KMeansBuilder::new().epochs(5.0).seed(Some(42)).build();
         let centroids: PlainSparseDatasetGrowable<u16, f32, DotProduct> = kmeans.train_refined(
             &dataset,
             2,
@@ -1149,7 +1253,7 @@ mod tests {
                 centroid.values().iter().take(2).copied().collect(),
             );
         };
-        let kmeans = KMeansBuilder::new().n_iter(5).seed(Some(42)).build();
+        let kmeans = KMeansBuilder::new().epochs(5.0).seed(Some(42)).build();
         let centroids: PlainSparseDatasetGrowable<u16, f32, DotProduct> = kmeans
             .train_with_index_refined(
                 &dataset,

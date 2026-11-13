@@ -532,19 +532,23 @@ which costs throughput without buying a useful accuracy/footprint point.
 `KMeans` clusters any dense or sparse dataset, writes centroids into a growable dataset whose encoder
 fixes their precision and the clustering metric, and accepts per-vector weights and a `refine` hook
 (e.g. `sparse_centroid_pruning`). How the centroids are fitted is its `Solver`:
-- `Solver::Lloyd` (the default, `LloydParams { n_iter: 10, n_redo: 1 }`): Lloyd's algorithm.
+- `Solver::Lloyd` (the default): Lloyd's algorithm.
 - `Solver::EMeans` (`EMeansParams`): e-means, mini-batch k-means with an exponential moving
   average, ported from [faiss `contrib/e_means`](https://github.com/facebookresearch/faiss/tree/main/contrib/e_means).
 
-E-means runs a fixed number of epochs (`nepochs`, default 5; an epoch is one sweep over the
-data), updating the centroids once per mini-batch rather than once per epoch as Lloyd's does. It
-picks the mini-batch size and step size from fitted scaling laws, so it needs no tuning. It typically
-matches Lloyd's quality in far less time; see Bessa et al., [*e-means: outperforming k-means (in
-one-tenth the epochs)*](https://arxiv.org/abs/2611.09501) ([citation](#citation)).
+Training runs for a budget of epochs, set with `KMeansBuilder::epochs` for either solver; an epoch
+assigns every training vector once, and costs about the same for both solvers. Lloyd's updates the
+centroids once per epoch, e-means once per mini-batch. Unset, the budget is the solver's default:
+10 epochs for Lloyd and 2 for e-means (faiss's e-means defaults to 5; 2 already matches or beats
+Lloyd at 10 in our benchmarks). E-means accepts fractional budgets and picks the mini-batch size and
+step size from fitted scaling laws, so it needs no tuning; see Bessa et al., [*e-means:
+outperforming k-means (in one-tenth the epochs)*](https://arxiv.org/abs/2611.09501)
+([citation](#citation)). `KMeansBuilder::n_redo` restarts either solver from new initial centroids
+and keeps the best.
 
 ```rust
 use vectorium::{
-    Dataset, EMeansParams, FlatIndex, IndexRefresh, KMeansBuilder, LloydParams, PlainDenseDataset,
+    Dataset, EMeansParams, FlatIndex, IndexRefresh, KMeansBuilder, PlainDenseDataset,
     PlainDenseDatasetGrowable, PlainDenseQuantizer, Solver, SquaredEuclideanDistance,
 };
 
@@ -556,15 +560,13 @@ let values: Vec<f32> = (0..n * d).map(|i| ((i * 7919) % 1000) as f32 / 100.0).co
 let data = Data::from_raw(values.into_boxed_slice(), n, PlainDenseQuantizer::new(d));
 
 // Flat (exhaustive) assignment; the centroid encoder fixes precision and metric.
-let lloyd = KMeansBuilder::new()
-    .solver(Solver::Lloyd(LloydParams { n_iter: 10, ..Default::default() }))
-    .seed(Some(42))
-    .build();
+let lloyd = KMeansBuilder::new().epochs(10.0).seed(Some(42)).build();
 let centroids: Centroids = lloyd.train(&data, k, None, PlainDenseQuantizer::new(d));
 assert_eq!(centroids.len(), k);
 
 let emeans = KMeansBuilder::new()
-    .solver(Solver::EMeans(EMeansParams { nepochs: 5.0, ..Default::default() }))
+    .solver(Solver::EMeans(EMeansParams::default()))
+    .epochs(2.0)
     .seed(Some(42))
     .build();
 let _: Centroids = emeans.train(&data, k, None, PlainDenseQuantizer::new(d));

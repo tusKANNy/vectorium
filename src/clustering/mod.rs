@@ -2,10 +2,10 @@
 //!
 //! [`KMeans`] owns everything shared by every way of fitting k-means centroids: initialisation,
 //! flat or index-accelerated assignment ([`IndexRefresh`], [`CentroidIndexBuilder`]), weights,
-//! the `refine` hook, spherical mode, seeding and the conversion of the centroids into a
-//! growable dataset. The [`Solver`] chosen with [`KMeansBuilder::solver`] decides how the
+//! the `refine` hook, spherical mode, seeding, restarts, the epoch budget and the conversion
+//! of the centroids into a growable dataset. The [`Solver`] chosen with [`KMeansBuilder::solver`] decides how the
 //! centroids are fitted:
-//! * [`Solver::Lloyd`] ([`LloydParams`], the default): Lloyd's algorithm.
+//! * [`Solver::Lloyd`] (the default): Lloyd's algorithm.
 //! * [`Solver::EMeans`] ([`EMeansParams`]): e-means, mini-batch k-means with an exponential
 //!   moving average and fitted scaling laws, ported from faiss `contrib/e_means`.
 //!
@@ -21,4 +21,3 @@ pub mod lloyd;
 pub use emeans::{BatchLaw, EMeansParams, EMeansRecipe};
 pub use index_assign::{CentroidIndexBuilder, IndexRefresh, RefreshEvery};
 pub use kmeans::{KMeans, KMeansBuilder, Solver, sparse_centroid_pruning};
-pub use lloyd::LloydParams;

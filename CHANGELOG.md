@@ -5,16 +5,17 @@ Newest entries go at the top of each section.
 
 ## [0.12.0] - unreleased
 
-Dependents: change the vectorium dependency to `0.12.0` (git tag `v0.12.0`). Existing k-means callers compile unchanged unless they implement `MeanDataset` themselves (see Breaking changes).
+Dependents: change the vectorium dependency to `0.12.0` (git tag `v0.12.0`), replace `KMeansBuilder::n_iter(n)` with `epochs(n as f64)`, and check the Breaking changes below: some builds produce different centroids.
 
 ### Added
 
-- **`Solver` for `KMeans`**: k-means is now one configuration with a pluggable solver, `KMeansBuilder::solver(Solver::Lloyd(LloydParams { .. }) | Solver::EMeans(EMeansParams { .. }))`. `KMeans` keeps everything the solvers share (initialisation, flat and index assignment, weights, `refine`, spherical mode, seeding, conversion to `G`, the index refresh policy, verbose output). The default is `Solver::Lloyd(LloydParams::default())`, i.e. the 0.11 behaviour with 10 iterations. `KMeansBuilder::n_iter` / `n_redo` remain as shorthands for the Lloyd parameters. `KMeans` and `KMeansBuilder` are `Clone + Debug`; `KMeans::solver()` returns the configured solver.
-- **E-means solver** (`Solver::EMeans`, `EMeansParams`): mini-batch EMA k-means, a port of faiss `contrib/e_means` (MIT, Meta; Bessa et al., arXiv 2611.09501). A fixed epoch budget (`nepochs`, default 5); mini-batch size and step size from the fitted scaling laws shipped in faiss (`EMeansRecipe`, `BatchLaw`, `EMeansParams::recipe`); cosine step-size schedule; revival of starved clusters; exact closing means. Dense and sparse, any metric, weights, `refine` hooks (`sparse_centroid_pruning` works unchanged), spherical mode. Deterministic for a seed across thread counts.
+- **`Solver` for `KMeans`**: k-means is now one configuration with a pluggable solver, `KMeansBuilder::solver(Solver::Lloyd | Solver::EMeans(EMeansParams { .. }))`. `KMeans` keeps everything the solvers share (initialisation, flat and index assignment, weights, `refine`, spherical mode, seeding, restarts, the epoch budget, conversion to `G`, the index refresh policy, verbose output). The default is `Solver::Lloyd` with 10 epochs, i.e. the 0.11 behaviour. `KMeans` and `KMeansBuilder` are `Clone + Debug`; `KMeans::solver()` returns the configured solver.
+- **Solver-independent epoch budget and restarts**: `KMeansBuilder::epochs(f64)` sets how many epochs training runs (an epoch assigns every training vector once, at about the same cost for both solvers). Unset, each solver uses its default, `Solver::default_epochs`: 10 for Lloyd and 2 for e-means. Lloyd needs a whole number of epochs and `build` panics otherwise; e-means accepts fractions. `KMeansBuilder::n_redo` restarts either solver from new initial centroids and keeps the restart whose final centroids score best. `KMeans::epochs()` and `KMeans::n_redo()` return the resolved values.
+- **E-means solver** (`Solver::EMeans`, `EMeansParams`): mini-batch EMA k-means, a port of faiss `contrib/e_means` (MIT, Meta; Bessa et al., arXiv 2611.09501). It runs the `KMeans` epoch budget, 2 epochs by default where faiss defaults to 5 (2 already matches or beats Lloyd at 10 in the PR's benchmarks); mini-batch size and step size come from the fitted scaling laws shipped in faiss (`EMeansRecipe`, `BatchLaw`, `EMeansParams::recipe`); cosine step-size schedule; revival of starved clusters; exact closing means. Dense and sparse, any metric, weights, `refine` hooks (`sparse_centroid_pruning` works unchanged), spherical mode. Deterministic for a seed across thread counts.
 - **Shared index-assignment policy** (`IndexRefresh`, `RefreshEvery`, `CentroidIndexBuilder`) for `train_with_index` with either solver: refresh the centroid index every `n` updates (a Lloyd iteration or an e-means mini-batch) or every `n` epochs, and always refresh after splits/revivals move centroids. Each vector takes the index's top result, with its distance recomputed exactly against the current centroid. Default: rebuild every update (the 0.11 behaviour). `CentroidIndexBuilder::refresh` lets an index update itself instead of being rebuilt (kANNolo's IVF over centroids only re-files them). Set with `KMeansBuilder::index_refresh`.
 - `MeanDataset::lerp(centroid, target, weight)`: the EMA update, dense and sparse (support union).
 - `ProductQuantizer::train_with_kmeans`, `MultiVecProductQuantizer::train_with_kmeans`, `MultiVecTwoLevelProductQuantizer::train_with_kmeans` (coarse and fine configurations) and `::train_from_coarse_with_kmeans` take a `KMeans`, so product quantizers can use either solver. The existing `train*` functions call them with the default Lloyd configuration.
-- `kmeans_bench --solver lloyd|emeans` with `--lloyd-n-iter`, `--emeans-epochs` and `--seed`; it now also reports the mean squared distance to the nearest centroid.
+- `kmeans_bench --solver lloyd|emeans` with `--epochs` and `--seed`; it now also reports the mean squared distance to the nearest centroid.
 
 ### Fixes
 
@@ -23,18 +24,23 @@ Dependents: change the vectorium dependency to `0.12.0` (git tag `v0.12.0`). Exi
 
 ### Breaking changes (relative to 0.11.1)
 
-None of these affect kANNolo, Seismic or tachiom.
-
+API:
+- **`KMeansBuilder::n_iter` is replaced by `KMeansBuilder::epochs`**, with no deprecated alias (dependents pin a vectorium version and switch when they move to this release). `n_iter(n)` becomes `epochs(n as f64)`. kANNolo and tachiom both call `n_iter`.
 - **`MeanDataset` has a new required method, `lerp`**, which e-means uses to move centroids. Only custom `MeanDataset` implementations need to add it.
 - **`KMeans::train_with_index` takes a `CentroidIndexBuilder` instead of a closure.** Closures implement it, so existing calls compile unchanged.
-- **Lloyd's result selection** (see Fixes): with a single restart, Lloyd now always returns its last iteration's centroids. For squared Euclidean distance with exact means and no splits the objective is non-increasing, so the result is the same as before up to floating-point noise once converged; otherwise it can differ.
+- **Stricter bounds on `train_with_index` / `train_with_index_refined`**, needed to recompute each assignment's distance exactly against the current centroids: `G: Sync`, `G::Encoder: VectorEncoder<QueryParams = ()>`, `<G::Encoder as VectorEncoder>::Distance: Distance + From<f32>` (replacing `Q::Distance: From<f32>`) and `&D::Vector: Into<<G::Encoder as VectorEncoder>::QueryVector>`. kANNolo's calls satisfy them; other callers may need to add them.
+
+Results (these builds produce different centroids than with 0.11.1; both changes are fixes):
+- **Lloyd's result selection** (see Fixes): Lloyd now returns its last iteration's centroids. For squared Euclidean distance with exact means and no splits the objective is non-increasing, so the result is the same as before up to floating-point noise once converged. Otherwise it can differ, in particular **kANNolo's sparse IVF built with `--centroid-nnz-factor`**, which runs Lloyd under the dot product with `sparse_centroid_pruning` as `refine`.
+- **Spherical builds** (e.g. kANNolo `--kmeans-spherical`): the initial centroids are now normalised.
+- **Restarts** (`n_redo > 1`): restarts are compared on their final centroids, and each restart now has its own split stream (initial centroids are drawn as before).
 
 ### Performance-relevant changes
 
 | Change |
 |---|
 | E-means against Lloyd's k-means and against faiss: see the PR for the benchmark tables. |
-| `KMeans::train` with the default Lloyd solver runs the same arithmetic in the same order as 0.11.1; results are unchanged except where the selection fix above applies. |
+| `KMeans::train` with the default Lloyd solver runs the same arithmetic in the same order as 0.11.1; results are unchanged except where the Breaking changes above apply. |
 
 ## [0.11.1] - 2026-10-21
 

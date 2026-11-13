@@ -1,9 +1,9 @@
 //! Lloyd's algorithm, the default [`Solver`](super::Solver) of [`KMeans`](super::KMeans).
 //!
-//! Every iteration assigns all training vectors to their nearest centroid, replaces each
-//! centroid by the (weighted) mean of its members and splits empty clusters off populated
-//! ones. Each restart returns its final centroids; with several restarts, the one whose final
-//! centroids have the best objective wins.
+//! Every iteration (one epoch) assigns all training vectors to their nearest centroid,
+//! replaces each centroid by the (weighted) mean of its members and splits empty clusters off
+//! populated ones. A run returns its final centroids; restarts are handled by
+//! [`KMeans`](super::KMeans).
 
 use super::index_assign::UpdateCtx;
 use super::kmeans::{Assign, ClusterGroups, Run, group_means, imbalance_factor, normalize_l2};
@@ -15,128 +15,82 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::time::Instant;
 
-/// Parameters of the Lloyd solver ([`Solver::Lloyd`](super::Solver::Lloyd)).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LloydParams {
-    /// Iterations per restart (default 10). Each is one epoch: a full pass over the data.
-    pub n_iter: usize,
-    /// Independent restarts from different initial centroids (default 1). The restart whose
-    /// final centroids have the best objective is returned; with more than one restart, each
-    /// restart's final centroids are scored with one extra assignment pass.
-    pub n_redo: usize,
-}
-
-impl Default for LloydParams {
-    fn default() -> Self {
-        Self {
-            n_iter: 10,
-            n_redo: 1,
-        }
-    }
-}
-
-/// Runs Lloyd's algorithm. `M` is the clustering metric, whose ordering ranks restarts.
-pub(super) fn fit<D, G, M>(
+/// Runs Lloyd's algorithm for `run.epochs` iterations and returns the final centroids.
+pub(super) fn fit<D, G>(
     run: &Run<'_, D, G>,
-    params: &LloydParams,
     assign: &mut Assign<'_, G>,
     refine: &(impl Fn(&[u32], &mut D::Vector) + Sync),
 ) -> G
 where
     D: MeanDataset + Sync,
     G: DatasetGrowable,
-    M: Distance + From<f32>,
+    <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
     for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
 {
     let k = run.k;
+    // Validated by `KMeansBuilder::build` to be a whole number.
+    let n_iter = run.epochs as usize;
     if run.verbose {
-        println!(
-            "Lloyd: {} iterations, {} restart(s)",
-            params.n_iter, params.n_redo
-        );
+        println!("Lloyd: {n_iter} iterations");
     }
-    // RNG used only for empty-cluster splitting, shared by all restarts.
+    // RNG used only for empty-cluster splitting.
     let mut split_rng = StdRng::seed_from_u64(run.seed);
-    let mut best: Option<(M, G)> = None;
+    let mut init_rng = StdRng::seed_from_u64(run.seed.wrapping_add(1));
+    let mut centroids: G = run.to_dataset(&run.initial_centroids(&mut init_rng));
 
-    for redo in 0..params.n_redo.max(1) {
-        // Offset by `redo` so each restart draws a different initial sample.
-        let mut init_rng = StdRng::seed_from_u64(run.seed.wrapping_add(1 + redo as u64));
-        let mut centroids: G = run.to_dataset(&run.initial_centroids(&mut init_rng));
+    let mut total_imbalance = 0.0;
+    let mut total_splits = 0;
+    let mut split_last = false;
 
-        let mut total_imbalance = 0.0;
-        let mut total_splits = 0;
-        let mut split_last = false;
-
-        for i in 0..params.n_iter {
-            let t0 = Instant::now();
-            let ctx = UpdateCtx {
-                update: i,
-                epoch: i,
-                epoch_start: true,
-                centroids_jumped: split_last,
-            };
-            let assignments = assign(&centroids, ctx, None);
-            let assign_time = t0.elapsed();
-
-            let t0 = Instant::now();
-            // The objective of the centroids this iteration assigned against (not of the
-            // updated ones below).
-            let obj: f32 = assignments.iter().map(|&(v, _)| v).sum();
-            let (n_split, histograms, means) = update_and_split(
-                run.dataset,
-                run.weights,
-                k,
-                &assignments,
-                &mut split_rng,
-                run.spherical,
-                refine,
-            );
-            centroids = run.to_dataset(&means);
-            let imbalance = imbalance_factor(histograms.iter().map(|&h| h as f64));
-            let split_time = t0.elapsed();
-
-            total_imbalance += imbalance;
-            total_splits += n_split;
-            split_last = n_split > 0;
-
-            if run.verbose {
-                println!(
-                    "Iteration {i}, objective: {}, imbalance: {imbalance:.4}, splits: {n_split}, \
-                     centroid nnz: {}, assign: {assign_time:.2?}, split: {split_time:.2?}",
-                    M::from(obj).distance(),
-                    centroids.nnz()
-                );
-            }
-        }
-
-        if run.verbose {
-            println!(
-                "Restart {redo} -- average imbalance: {:.4}, splits: {total_splits}",
-                total_imbalance / params.n_iter.max(1) as f64,
-            );
-        }
-
-        if params.n_redo <= 1 {
-            return centroids;
-        }
-        // Score this restart's final centroids with one more assignment pass, so restarts are
-        // compared on the centroids they actually return.
+    for i in 0..n_iter {
+        let t0 = Instant::now();
         let ctx = UpdateCtx {
-            update: params.n_iter,
-            epoch: params.n_iter,
+            update: i,
+            epoch: i,
             epoch_start: true,
             centroids_jumped: split_last,
         };
-        let obj = M::from(assign(&centroids, ctx, None).iter().map(|&(v, _)| v).sum());
+        let assignments = assign(&centroids, ctx, None);
+        let assign_time = t0.elapsed();
+
+        let t0 = Instant::now();
+        // The objective of the centroids this iteration assigned against (not of the updated
+        // ones below).
+        let obj: f32 = assignments.iter().map(|&(v, _)| v).sum();
+        let (n_split, histograms, means) = update_and_split(
+            run.dataset,
+            run.weights,
+            k,
+            &assignments,
+            &mut split_rng,
+            run.spherical,
+            refine,
+        );
+        centroids = run.to_dataset(&means);
+        let imbalance = imbalance_factor(histograms.iter().map(|&h| h as f64));
+        let split_time = t0.elapsed();
+
+        total_imbalance += imbalance;
+        total_splits += n_split;
+        split_last = n_split > 0;
+
         if run.verbose {
-            println!("Restart {redo} final objective: {}", obj.distance());
-        }
-        if best.as_ref().is_none_or(|(b, _)| obj < *b) {
-            best = Some((obj, centroids));
+            println!(
+                "Iteration {i}, objective: {}, imbalance: {imbalance:.4}, splits: {n_split}, \
+                 centroid nnz: {}, assign: {assign_time:.2?}, split: {split_time:.2?}",
+                <G::Encoder as VectorEncoder>::Distance::from(obj).distance(),
+                centroids.nnz()
+            );
         }
     }
-    best.expect("at least one restart").1
+
+    if run.verbose {
+        println!(
+            "Average imbalance: {:.4}, splits: {total_splits}",
+            total_imbalance / n_iter.max(1) as f64,
+        );
+    }
+    centroids
 }
 
 /// Computes the centroids as the (weighted) means of the vectors assigned to each cluster,
@@ -251,31 +205,34 @@ mod tests {
     }
 
     /// With several restarts, the result is the restart whose *returned* centroids score best,
-    /// which is the best of the same restarts run one at a time. (Restart `r` of seed `s`
-    /// draws its initial centroids with seed `s + 1 + r`, as a single run of seed `s + r` does;
-    /// the split stream differs, but this data has no empty clusters.)
+    /// which is the best of the same restarts run one at a time: restart `r` of seed `s` is a
+    /// single run of seed `s + r`. Restarts belong to `KMeans`, so this holds for both solvers.
     #[test]
     fn restarts_compete_on_their_returned_centroids() {
+        use crate::clustering::{EMeansParams, Solver};
         let ds = overlapping(4_000, 8, 5);
         let k = 16;
-        let train = |seed: u64, n_redo: usize| -> Grow {
-            KMeansBuilder::new()
-                .n_iter(4)
-                .n_redo(n_redo)
-                .seed(Some(seed))
-                .build()
-                .train(&ds, k, None, PlainDenseQuantizer::new(8))
-        };
-        let singles: Vec<Grow> = (0..3).map(|r| train(10 + r, 1)).collect();
-        let objectives: Vec<f64> = singles.iter().map(|c| objective(&ds, c)).collect();
-        assert!(
-            objectives.windows(2).any(|w| w[0] != w[1]),
-            "restarts should differ: {objectives:?}"
-        );
-        let best = (0..3)
-            .min_by(|&a, &b| objectives[a].total_cmp(&objectives[b]))
-            .unwrap();
-        assert_eq!(train(10, 3).values(), singles[best].values());
+        for solver in [Solver::Lloyd, Solver::EMeans(EMeansParams::default())] {
+            let train = |seed: u64, n_redo: usize| -> Grow {
+                KMeansBuilder::new()
+                    .solver(solver.clone())
+                    .epochs(4.0)
+                    .n_redo(n_redo)
+                    .seed(Some(seed))
+                    .build()
+                    .train(&ds, k, None, PlainDenseQuantizer::new(8))
+            };
+            let singles: Vec<Grow> = (0..3).map(|r| train(10 + r, 1)).collect();
+            let objectives: Vec<f64> = singles.iter().map(|c| objective(&ds, c)).collect();
+            assert!(
+                objectives.windows(2).any(|w| w[0] != w[1]),
+                "{solver:?}: restarts should differ: {objectives:?}"
+            );
+            let best = (0..3)
+                .min_by(|&a, &b| objectives[a].total_cmp(&objectives[b]))
+                .unwrap();
+            assert_eq!(train(10, 3).values(), singles[best].values(), "{solver:?}");
+        }
     }
 
     /// Each run returns its last update, even when an earlier iteration scored better. Two
@@ -302,7 +259,7 @@ mod tests {
             c.as_mut()[2] = (update + 1) as f32;
         };
         let c: Grow = KMeansBuilder::new()
-            .n_iter(n_iter)
+            .epochs(n_iter as f64)
             .seed(Some(1))
             .build()
             .train_refined(&ds, k, None, PlainDenseQuantizer::new(3), tag);
@@ -320,23 +277,30 @@ mod tests {
         );
     }
 
-    /// Spherical Lloyd assigns against unit-norm initial centroids, so a long training vector
-    /// drawn as an initial centroid does not attract every vector under the dot product.
+    /// In spherical mode the initial centroids are unit-norm, so a long training vector drawn
+    /// as an initial centroid does not attract every vector under the dot product.
     #[test]
     fn spherical_normalizes_initial_centroids() {
+        use crate::clustering::kmeans::Run;
         let ds = PlainDenseDataset::<f32, DotProduct>::from_raw(
             vec![100.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.1].into_boxed_slice(),
             4,
             PlainDenseQuantizer::new(2),
         );
-        let km = KMeansBuilder::new()
-            .n_iter(0)
-            .seed(Some(0))
-            .spherical(true)
-            .build();
-        let c: PlainDenseDatasetGrowable<f32, DotProduct> =
-            km.train(&ds, 2, None, PlainDenseQuantizer::new(2));
-        for row in c.values().chunks_exact(2) {
+        let encoder = PlainDenseQuantizer::new(2);
+        let run = Run::<_, PlainDenseDatasetGrowable<f32, DotProduct>> {
+            dataset: &ds,
+            k: 4,
+            weights: None,
+            encoder: &encoder,
+            epochs: 1.0,
+            seed: 0,
+            spherical: true,
+            verbose: false,
+        };
+        // k = n: every vector, the long one included, is an initial centroid.
+        for c in run.initial_centroids(&mut StdRng::seed_from_u64(0)) {
+            let row = c.values();
             let norm = (row[0] * row[0] + row[1] * row[1]).sqrt();
             assert!((norm - 1.0).abs() < 1e-6, "initial centroid norm {norm}");
         }

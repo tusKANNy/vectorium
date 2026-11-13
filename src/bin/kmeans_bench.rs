@@ -4,7 +4,7 @@ use clap::{Parser, ValueEnum};
 use num_traits::FromPrimitive;
 use std::path::{Path, PathBuf};
 use vectorium::PlainDenseDatasetGrowable;
-use vectorium::clustering::{EMeansParams, KMeans, KMeansBuilder, LloydParams, Solver};
+use vectorium::clustering::{EMeansParams, KMeans, KMeansBuilder, Solver};
 use vectorium::core::vector::DenseVectorView;
 use vectorium::datasets::readers::{read_npy_f32, read_seismic_format};
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
@@ -33,13 +33,10 @@ struct Args {
     #[arg(long, value_enum, default_value_t = SolverArg::Lloyd)]
     solver: SolverArg,
 
-    /// Lloyd iterations (each is one epoch)
-    #[arg(long, default_value_t = 10)]
-    lloyd_n_iter: usize,
-
-    /// e-means epochs over the data (fractional allowed)
-    #[arg(long, default_value_t = 5.0)]
-    emeans_epochs: f64,
+    /// Epoch budget (default: the solver's, 10 for Lloyd and 2 for e-means). Lloyd needs a
+    /// whole number; e-means accepts fractions.
+    #[arg(long)]
+    epochs: Option<f64>,
 
     /// RNG seed (default: from entropy)
     #[arg(long)]
@@ -66,20 +63,17 @@ fn main() {
     };
 
     let solver = match args.solver {
-        SolverArg::Lloyd => Solver::Lloyd(LloydParams {
-            n_iter: args.lloyd_n_iter,
-            ..Default::default()
-        }),
-        SolverArg::Emeans => Solver::EMeans(EMeansParams {
-            nepochs: args.emeans_epochs,
-            ..Default::default()
-        }),
+        SolverArg::Lloyd => Solver::Lloyd,
+        SolverArg::Emeans => Solver::EMeans(EMeansParams::default()),
     };
-    let kmeans = KMeansBuilder::new()
+    let mut builder = KMeansBuilder::new()
         .solver(solver)
         .seed(args.seed)
-        .verbose(true)
-        .build();
+        .verbose(true);
+    if let Some(epochs) = args.epochs {
+        builder = builder.epochs(epochs);
+    }
+    let kmeans = builder.build();
 
     println!(
         "Running k-means ({:?}) on {} vectors, {}D, {} clusters",

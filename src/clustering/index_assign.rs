@@ -244,8 +244,11 @@ mod tests {
     }
 
     /// A k-means builder with the e-means solver and these parameters.
+    /// A k-means builder with this e-means solver and a 5-epoch budget.
     fn emeans_with(params: EMeansParams) -> KMeansBuilder {
-        KMeansBuilder::new().solver(Solver::EMeans(params))
+        KMeansBuilder::new()
+            .solver(Solver::EMeans(params))
+            .epochs(5.0)
     }
 
     /// A flat-index builder that counts builds and refreshes.
@@ -320,13 +323,12 @@ mod tests {
         // Fix a small batch so there are many updates per epoch; revival off so only the
         // cadence triggers refreshes (revival forces one, see `centroid_jump_forces_refresh`).
         let params = EMeansParams {
-            nepochs: 3.0,
             batch_size: Some(100),
             unused_threshold: Some(0.0),
             ..Default::default()
         };
-        let recipe = params.recipe(ds.len(), k, 8);
-        let base = emeans_with(params).seed(Some(1));
+        let recipe = params.recipe(ds.len(), k, 8, 3.0);
+        let base = emeans_with(params).epochs(3.0).seed(Some(1));
         let total = recipe.total_steps;
         assert_eq!(recipe.epoch_steps, vec![20, 20, 20]);
 
@@ -394,7 +396,7 @@ mod tests {
         let dup = Plain::from_raw(values.into_boxed_slice(), 300, enc(4));
         let b = Counting::default();
         let km = KMeansBuilder::new()
-            .n_iter(5)
+            .epochs(5.0)
             .seed(Some(1))
             .index_refresh(never)
             .build();
@@ -423,7 +425,7 @@ mod tests {
         let (ds, _) = blobs(4, 200, 8, 2);
         let b = Counting::default();
         let km = KMeansBuilder::new()
-            .n_iter(6)
+            .epochs(6.0)
             .n_redo(2)
             .seed(Some(3))
             .build();
@@ -434,7 +436,7 @@ mod tests {
 
         let b = Counting::default();
         let km = KMeansBuilder::new()
-            .n_iter(6)
+            .epochs(6.0)
             .seed(Some(3))
             .index_refresh(IndexRefresh::every_updates(3))
             .build();
@@ -478,7 +480,7 @@ mod tests {
         let mean = |f: &dyn Fn(u64) -> Grow| -> f64 {
             seeds.clone().map(|s| objective(&ds, &f(s))).sum::<f64>() / 5.0
         };
-        let km = |s| KMeansBuilder::new().n_iter(10).seed(Some(s));
+        let km = |s| KMeansBuilder::new().epochs(10.0).seed(Some(s));
         let flat = mean(&|s| km(s).build().train(&ds, k, None, enc(8)));
         let idx = mean(&|s| {
             km(s).index_refresh(stale).build().train_with_index(
@@ -510,7 +512,7 @@ mod tests {
     fn default_kmeans_index_path_matches_flat_path() {
         // With a fresh exact index every iteration, train_with_index reproduces train.
         let (ds, _) = blobs(5, 300, 10, 9);
-        let km = KMeansBuilder::new().n_iter(5).seed(Some(11)).build();
+        let km = KMeansBuilder::new().epochs(5.0).seed(Some(11)).build();
         let flat: Grow = km.train(&ds, 7, None, enc(10));
         let indexed: Grow = km.train_with_index(&ds, 7, None, enc(10), FlatIndex::from, &());
         assert_close(&flat, &indexed);
