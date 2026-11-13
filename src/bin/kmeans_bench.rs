@@ -4,7 +4,7 @@ use clap::{Parser, ValueEnum};
 use num_traits::FromPrimitive;
 use std::path::{Path, PathBuf};
 use vectorium::PlainDenseDatasetGrowable;
-use vectorium::clustering::{Clustering, ClusteringConfig, EMeansBuilder, KMeans, KMeansBuilder};
+use vectorium::clustering::{EMeansParams, KMeans, KMeansBuilder, LloydParams, Solver};
 use vectorium::core::vector::DenseVectorView;
 use vectorium::datasets::readers::{read_npy_f32, read_seismic_format};
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
@@ -29,17 +29,17 @@ struct Args {
     #[arg(long)]
     n_clusters: usize,
 
-    /// Clustering algorithm
-    #[arg(long, value_enum, default_value_t = Algorithm::Kmeans)]
-    clustering: Algorithm,
+    /// K-means solver
+    #[arg(long, value_enum, default_value_t = SolverArg::Lloyd)]
+    solver: SolverArg,
 
     /// Lloyd iterations (each is one epoch)
     #[arg(long, default_value_t = 10)]
-    n_iter: usize,
+    lloyd_n_iter: usize,
 
     /// e-means epochs over the data (fractional allowed)
     #[arg(long, default_value_t = 5.0)]
-    epochs: f64,
+    emeans_epochs: f64,
 
     /// RNG seed (default: from entropy)
     #[arg(long)]
@@ -47,8 +47,8 @@ struct Args {
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-enum Algorithm {
-    Kmeans,
+enum SolverArg {
+    Lloyd,
     Emeans,
 }
 
@@ -65,29 +65,32 @@ fn main() {
         other => panic!("Unsupported dataset type '{}'", other),
     };
 
-    let clustering: ClusteringConfig = match args.clustering {
-        Algorithm::Kmeans => KMeansBuilder::new()
-            .n_iter(args.n_iter)
-            .seed(args.seed)
-            .verbose(true)
-            .into(),
-        Algorithm::Emeans => EMeansBuilder::new()
-            .nepochs(args.epochs)
-            .seed(args.seed)
-            .verbose(true)
-            .into(),
+    let solver = match args.solver {
+        SolverArg::Lloyd => Solver::Lloyd(LloydParams {
+            n_iter: args.lloyd_n_iter,
+            ..Default::default()
+        }),
+        SolverArg::Emeans => Solver::EMeans(EMeansParams {
+            nepochs: args.emeans_epochs,
+            ..Default::default()
+        }),
     };
+    let kmeans = KMeansBuilder::new()
+        .solver(solver)
+        .seed(args.seed)
+        .verbose(true)
+        .build();
 
     println!(
-        "Running {:?} on {} vectors, {}D, {} clusters",
-        args.clustering,
+        "Running k-means ({:?}) on {} vectors, {}D, {} clusters",
+        args.solver,
         dataset.len(),
         dataset.output_dim(),
         args.n_clusters,
     );
 
     let t0 = Instant::now();
-    let centroids: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> = clustering.train(
+    let centroids: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> = kmeans.train(
         &dataset,
         args.n_clusters,
         None,

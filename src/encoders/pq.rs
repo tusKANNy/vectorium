@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::PlainDenseDataset;
 use crate::PlainDenseQuantizer;
 use crate::SpaceUsage;
-use crate::clustering::{Clustering, KMeansBuilder};
+use crate::clustering::{KMeans, KMeansBuilder};
 use crate::core::vector::{DenseVectorOwned, DenseVectorView};
 use crate::core::vector_encoder::{DenseVectorEncoder, QueryEvaluator, VectorEncoder};
 use crate::distances::{Distance, DotProduct, SquaredEuclideanDistance};
@@ -96,24 +96,21 @@ where
         seed: Option<u64>,
     ) -> Self {
         let kmeans = KMeansBuilder::new().n_iter(n_iter).seed(seed).build();
-        Self::train_with_clustering(training_data, &kmeans)
+        Self::train_with_kmeans(training_data, &kmeans)
     }
 
-    /// Train a ProductQuantizer with any [`Clustering`] algorithm (e.g. [`KMeans`] or
-    /// [`EMeans`]) for the per-subspace codebooks. The same `clustering` instance (and so the
-    /// same seed) is used for every subspace, in parallel.
-    ///
-    /// [`KMeans`]: crate::clustering::KMeans
-    /// [`EMeans`]: crate::clustering::EMeans
-    pub fn train_with_clustering<Ds: crate::ScalarDenseSupportedDistance, Cl: Clustering>(
+    /// Train a ProductQuantizer with the given [`KMeans`] configuration (any
+    /// [`Solver`](crate::clustering::Solver)) for the per-subspace codebooks. The same
+    /// configuration (and so the same seed) is used for every subspace, in parallel.
+    pub fn train_with_kmeans<Ds: crate::ScalarDenseSupportedDistance>(
         training_data: &PlainDenseDataset<f32, Ds>,
-        clustering: &Cl,
+        kmeans: &KMeans,
     ) -> Self {
         let d = training_data.output_dim();
         assert_eq!(M % 4, 0, "M ({}) is not divisible by 4", M);
         assert_eq!(d % M, 0, "d ({}) is not divisible by M ({})", d, M);
         let dsub = d / M;
-        let centroids = Self::train_centroids(training_data, dsub, clustering).into_boxed_slice();
+        let centroids = Self::train_centroids(training_data, dsub, kmeans).into_boxed_slice();
         Self {
             d,
             dsub,
@@ -123,18 +120,18 @@ where
     }
 
     /// Returns a flat Vec<f32> of length M * dsub * KSUB in SoA layout: [M × dsub × KSUB].
-    /// Clustering output is AoS [KSUB × dsub]; we transpose each subspace to SoA [dsub × KSUB]
+    /// KMeans output is AoS [KSUB × dsub]; we transpose each subspace to SoA [dsub × KSUB]
     /// so that the distance table build inner loop is over contiguous KSUB f32 values.
-    fn train_centroids<Ds: crate::ScalarDenseSupportedDistance, Cl: Clustering>(
+    fn train_centroids<Ds: crate::ScalarDenseSupportedDistance>(
         training_data: &PlainDenseDataset<f32, Ds>,
         dsub: usize,
-        clustering: &Cl,
+        kmeans: &KMeans,
     ) -> Vec<f32> {
         use rayon::prelude::*;
 
-        println!("Clustering {} PQ subspaces", M);
+        println!("Running K-Means for {} subspaces", M);
 
-        // Each rayon task trains one subspace, gets AoS centroids from the clustering,
+        // Each rayon task trains one subspace, gets AoS centroids from KMeans,
         // and transposes them to SoA before returning.
         let parts: Vec<Vec<f32>> = (0..M)
             .into_par_iter()
@@ -154,8 +151,8 @@ where
                 }
 
                 let trained: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> =
-                    clustering.train(&sub_dataset, KSUB, None, PlainDenseQuantizer::new(dsub));
-                // Clustering returns AoS: [c0_d0, c0_d1, .., c0_{dsub-1}, c1_d0, ..]
+                    kmeans.train(&sub_dataset, KSUB, None, PlainDenseQuantizer::new(dsub));
+                // KMeans returns AoS: [c0_d0, c0_d1, .., c0_{dsub-1}, c1_d0, ..]
                 // Transpose to SoA: [d0_c0, d0_c1, .., d0_{KSUB-1}, d1_c0, ..]
                 let aos = trained.values();
                 let mut soa = vec![0.0_f32; KSUB * dsub];
@@ -168,7 +165,7 @@ where
             })
             .collect();
 
-        println!("PQ subspace clustering finished");
+        println!("K-Means finished");
 
         let mut flat = Vec::with_capacity(M * dsub * KSUB);
         for part in parts {

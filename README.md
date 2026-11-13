@@ -527,14 +527,14 @@ no `query_bits` dial. The intermediate widths
 which costs throughput without buying a useful accuracy/footprint point.
 
 
-### 10) Clustering: k-means and e-means
+### 10) Clustering: k-means with Lloyd or e-means
 
-`KMeans` (Lloyd) and `EMeans` (mini-batch k-means with an exponential moving average, ported from
-[faiss `contrib/e_means`](https://github.com/facebookresearch/faiss/tree/main/contrib/e_means)) implement
-one `Clustering` trait, so code generic over `Cl: Clustering` (product quantizers here, IVF in kANNolo)
-swaps one for the other; `ClusteringConfig` picks one at run time. Both cluster any dense or sparse
-dataset, write centroids into a growable dataset whose encoder fixes their precision and the clustering
-metric, and accept per-vector weights and a `refine` hook (e.g. `sparse_centroid_pruning`).
+`KMeans` clusters any dense or sparse dataset, writes centroids into a growable dataset whose encoder
+fixes their precision and the clustering metric, and accepts per-vector weights and a `refine` hook
+(e.g. `sparse_centroid_pruning`). How the centroids are fitted is its `Solver`:
+- `Solver::Lloyd` (the default, `LloydParams { n_iter: 10, n_redo: 1 }`): Lloyd's algorithm.
+- `Solver::EMeans` (`EMeansParams`): e-means, mini-batch k-means with an exponential moving
+  average, ported from [faiss `contrib/e_means`](https://github.com/facebookresearch/faiss/tree/main/contrib/e_means).
 
 E-means runs a fixed number of epochs (`nepochs`, default 5; an epoch is one sweep over the
 data), updating the centroids once per mini-batch rather than once per epoch as Lloyd's does. It
@@ -544,8 +544,8 @@ one-tenth the epochs)*](https://arxiv.org/abs/2611.09501) ([citation](#citation)
 
 ```rust
 use vectorium::{
-    Clustering, ClusteringConfig, Dataset, EMeansBuilder, FlatIndex, IndexRefresh, KMeansBuilder,
-    PlainDenseDataset, PlainDenseDatasetGrowable, PlainDenseQuantizer, SquaredEuclideanDistance,
+    Dataset, EMeansParams, FlatIndex, IndexRefresh, KMeansBuilder, LloydParams, PlainDenseDataset,
+    PlainDenseDatasetGrowable, PlainDenseQuantizer, Solver, SquaredEuclideanDistance,
 };
 
 type Data = PlainDenseDataset<f32, SquaredEuclideanDistance>;
@@ -556,24 +556,30 @@ let values: Vec<f32> = (0..n * d).map(|i| ((i * 7919) % 1000) as f32 / 100.0).co
 let data = Data::from_raw(values.into_boxed_slice(), n, PlainDenseQuantizer::new(d));
 
 // Flat (exhaustive) assignment; the centroid encoder fixes precision and metric.
-let emeans = EMeansBuilder::new().nepochs(5.0).seed(Some(42)).build();
-let centroids: Centroids = emeans.train(&data, k, None, PlainDenseQuantizer::new(d));
+let lloyd = KMeansBuilder::new()
+    .solver(Solver::Lloyd(LloydParams { n_iter: 10, ..Default::default() }))
+    .seed(Some(42))
+    .build();
+let centroids: Centroids = lloyd.train(&data, k, None, PlainDenseQuantizer::new(d));
 assert_eq!(centroids.len(), k);
 
-// Chosen at run time (e.g. from a CLI flag); the default is k-means.
-let config: ClusteringConfig = KMeansBuilder::new().n_iter(10).seed(Some(42)).into();
-let _: Centroids = config.train(&data, k, None, PlainDenseQuantizer::new(d));
+let emeans = KMeansBuilder::new()
+    .solver(Solver::EMeans(EMeansParams { nepochs: 5.0, ..Default::default() }))
+    .seed(Some(42))
+    .build();
+let _: Centroids = emeans.train(&data, k, None, PlainDenseQuantizer::new(d));
 
 // Assignment through an index over the centroids (an HNSW or IVF when k is large). By default the
-// index is rebuilt for every update; `IndexRefresh` trades refreshes for exactly re-ranked candidates.
-let emeans = EMeansBuilder::new()
+// index is rebuilt for every update; `IndexRefresh` sets a longer cadence, trading accuracy for fewer refreshes.
+let emeans = KMeansBuilder::new()
+    .solver(Solver::EMeans(EMeansParams::default()))
     .seed(Some(42))
-    .index_refresh(IndexRefresh::every_updates(4).with_candidates(2))
+    .index_refresh(IndexRefresh::every_updates(4))
     .build();
 let _: Centroids = emeans.train_with_index(&data, k, None, PlainDenseQuantizer::new(d), FlatIndex::from, &());
 ```
 
-Product quantizers take any algorithm too: `ProductQuantizer::train_with_clustering(&data, &emeans)`.
+Product quantizers take a `KMeans` too, with either solver: `ProductQuantizer::train_with_kmeans(&data, &emeans)`.
 
 
 ## Design notes
@@ -603,7 +609,7 @@ If you use Vectorium in your work, please cite our paper (submitted to *Informat
 }
 ```
 
-If you use `EMeans`, please also cite the e-means paper:
+If you use the e-means solver, please also cite the e-means paper:
 
 ```bibtex
 @misc{bessa2026emeans,

@@ -40,7 +40,7 @@ use faer::mat;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::clustering::{Clustering, KMeansBuilder};
+use crate::clustering::{KMeans, KMeansBuilder};
 use crate::core::vector::{DenseMultiVectorOwned, DenseMultiVectorView, DenseVectorView};
 use crate::core::vector_encoder::{MultiVecEncoder, QueryEvaluator, VectorEncoder};
 use crate::distances::{DotProduct, SquaredEuclideanDistance};
@@ -180,17 +180,17 @@ impl<const M: usize, In> MultiVecTwoLevelProductQuantizer<M, In> {
         ncoarse: usize,
     ) -> Self {
         let kmeans = KMeansBuilder::new().build();
-        Self::train_with_clustering(token_vectors, ncoarse, &kmeans, &kmeans)
+        Self::train_with_kmeans(token_vectors, ncoarse, &kmeans, &kmeans)
     }
 
-    /// Like [`train`](Self::train), but with any [`Clustering`] algorithms (e.g.
-    /// [`EMeans`](crate::clustering::EMeans)): `coarse` for the `ncoarse` coarse centroids,
+    /// Like [`train`](Self::train), but with the given [`KMeans`] configurations (any
+    /// [`Solver`](crate::clustering::Solver)): `coarse` for the `ncoarse` coarse centroids,
     /// `fine` for the per-subspace PQ codebooks on the residuals.
-    pub fn train_with_clustering<Cc: Clustering, Cf: Clustering>(
+    pub fn train_with_kmeans(
         token_vectors: &PlainDenseDataset<f32, SquaredEuclideanDistance>,
         ncoarse: usize,
-        coarse: &Cc,
-        fine: &Cf,
+        coarse: &KMeans,
+        fine: &KMeans,
     ) -> Self {
         let token_dim = token_vectors.output_dim();
         let n = token_vectors.len();
@@ -326,7 +326,7 @@ impl<const M: usize, In> MultiVecTwoLevelProductQuantizer<M, In> {
         In: ValueType,
     {
         let kmeans = KMeansBuilder::new().n_iter(n_iter).seed(seed).build();
-        Self::train_from_coarse_with_clustering(
+        Self::train_from_coarse_with_kmeans(
             coarse_centroids,
             flat_input,
             assignments,
@@ -337,14 +337,14 @@ impl<const M: usize, In> MultiVecTwoLevelProductQuantizer<M, In> {
     }
 
     /// Like [`train_from_coarse`](Self::train_from_coarse), but trains the residual PQ with
-    /// any [`Clustering`] algorithm (which carries its own iteration budget and seed).
-    pub fn train_from_coarse_with_clustering<Cl: Clustering>(
+    /// the given [`KMeans`] configuration (which carries its own solver, budget and seed).
+    pub fn train_from_coarse_with_kmeans(
         coarse_centroids: PlainDenseDataset<f32, SquaredEuclideanDistance>,
         flat_input: &[In],
         assignments: &[usize],
         sample_size: usize,
         normalize: bool,
-        clustering: &Cl,
+        kmeans: &KMeans,
     ) -> Self
     where
         In: ValueType,
@@ -384,7 +384,7 @@ impl<const M: usize, In> MultiVecTwoLevelProductQuantizer<M, In> {
         );
 
         // Build sorted sample indices for sequential memory access.
-        // The clustering's seed controls its initialisation only.
+        // The k-means seed controls its initialisation only.
         // Pass sample_size >= n_tokens to skip resampling (e.g. caller pre-selected the subset).
         let sample_indices: Vec<usize> = if train_n >= n_tokens {
             (0..n_tokens).collect()
@@ -433,9 +433,9 @@ impl<const M: usize, In> MultiVecTwoLevelProductQuantizer<M, In> {
             M, KSUB
         );
 
-        let pq = ProductQuantizer::<M, SquaredEuclideanDistance>::train_with_clustering(
+        let pq = ProductQuantizer::<M, SquaredEuclideanDistance>::train_with_kmeans(
             &residuals_ds,
-            clustering,
+            kmeans,
         );
         let pq_centroids_aos = pq.centroids_as_aos(); // [M × KSUB × dsub] AoS
         let pq_centroids: Vec<PlainDenseDataset<f32, SquaredEuclideanDistance>> = (0..M)

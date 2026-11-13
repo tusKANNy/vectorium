@@ -35,36 +35,37 @@
 //!
 //! # Representation and metric
 //!
-//! E-means has [`KMeans`]'s contract: it clusters any [`MeanDataset`] (batch means are
-//! [`MeanDataset::mean`], the EMA step is [`MeanDataset::lerp`]) into a growable centroid
-//! dataset `G` whose encoder fixes the centroids' precision and the clustering metric. The
+//! E-means is a [`Solver`] of [`KMeans`], so it shares its contract: it clusters any
+//! [`MeanDataset`] (batch means are [`MeanDataset::mean`], the EMA step is
+//! [`MeanDataset::lerp`]) into a growable centroid dataset `G` whose encoder fixes the
+//! centroids' precision and the clustering metric. The
 //! scaling laws were fitted on dense data under squared Euclidean distance; other metrics and
 //! sparse data work, but are outside that fit.
 //!
 //! # Differences from the faiss implementation
 //!
-//! * Assignment uses vectorium's distance kernels (the same as [`KMeans`]), not BLAS, so a
-//!   benchmark against `KMeans` compares algorithms, not kernels.
+//! * Assignment uses vectorium's distance kernels (the same as the Lloyd solver), not BLAS, so
+//!   a benchmark against Lloyd compares solvers, not kernels.
 //! * Random streams come from `rand::StdRng`, not NumPy's `RandomState`, so results are not
 //!   bit-identical to faiss for the same seed. They are reproducible for a fixed seed, across
 //!   thread counts.
 //! * Optional per-vector `weights` turn counts and means into weighted counts and means, and an
-//!   optional `refine` hook post-processes every updated centroid (as in [`KMeans`]).
-//! * [`train_with_index`](Clustering::train_with_index) maintains its centroid index with the
-//!   policy shared by every algorithm ([`IndexRefresh`]): by default the index is refreshed for
+//!   optional `refine` hook post-processes every updated centroid (as for Lloyd).
+//! * [`KMeans::train_with_index`] maintains its centroid index with the
+//!   policy shared by every solver ([`IndexRefresh`]): by default the index is refreshed for
 //!   every mini-batch, as in faiss's IVF e-means, and always right after a revival moved
-//!   centroids; a longer cadence plus exact re-ranking of several candidates trades accuracy
-//!   for index maintenance.
+//!   centroids; a longer cadence trades assignment accuracy for index maintenance.
 
-use super::index_assign::{CentroidIndexBuilder, IndexRefresh, IndexedAssigner, UpdateCtx};
-use super::{Clustering, KMeans};
+#[cfg(doc)]
+use super::index_assign::IndexRefresh;
+use super::index_assign::UpdateCtx;
+use super::kmeans::{Assign, ClusterGroups, Run, imbalance_factor};
+#[cfg(doc)]
+use super::kmeans::{KMeans, Solver};
 use crate::core::dataset::{DatasetGrowable, MeanDataset};
-use crate::core::distances::Distance;
-use crate::core::index::Index;
 use crate::core::vector_encoder::VectorEncoder;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::seq::index;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use std::time::{Duration, Instant};
@@ -251,54 +252,38 @@ fn scheduled_alpha(alpha0: f64, step: usize, total_steps: usize) -> f64 {
     alpha0 * (ALPHA_MIN_FACTOR + (1.0 - ALPHA_MIN_FACTOR) * cosine)
 }
 
-/// Assigns the vectors of one batch to centroids: called with the current centroids (as the
-/// caller's centroid dataset), the update's position in training, and the batch's vector ids.
-/// Returns `(distance, centroid id)` per vector, in batch order.
-type BatchAssigner<'a, G> = dyn FnMut(&G, UpdateCtx, &[u32]) -> Vec<(f32, usize)> + 'a;
+/// Parameters of the e-means solver ([`Solver::EMeans`](super::Solver::EMeans)). Every option
+/// defaults to the faiss `NumpyEmeans` default.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EMeansParams {
+    /// Epoch budget `T` (default 5). Fractional values add a partial epoch.
+    pub nepochs: f64,
+    /// Fixes the batch size `B` instead of using the batch law. The step law still sets
+    /// `alpha0` for this `B` unless `alpha0` is also given.
+    pub batch_size: Option<usize>,
+    /// Fixes the initial EMA step instead of using the step law.
+    pub alpha0: Option<f64>,
+    /// The batch law used when no batch size is given (default [`BatchLaw::Auto`]).
+    pub batch_law: BatchLaw,
+    /// Revival threshold `tau` (`Some(0.0)` disables revival). `None` (default) is 0.1, or 0
+    /// when `d <= 2`.
+    pub unused_threshold: Option<f32>,
+}
 
-/// Contiguous runs `(start, end)` of `pairs` (sorted by cluster) sharing one cluster, indexed
-/// by cluster: `None` for clusters without members.
-fn group_by_cluster(pairs: &[(u32, u32)], k: usize) -> Vec<Option<(usize, usize)>> {
-    let mut groups = vec![None; k];
-    let mut s = 0;
-    for t in 1..=pairs.len() {
-        if t == pairs.len() || pairs[t].0 != pairs[s].0 {
-            groups[pairs[s].0 as usize] = Some((s, t));
-            s = t;
+impl Default for EMeansParams {
+    fn default() -> Self {
+        Self {
+            nepochs: 5.0,
+            batch_size: None,
+            alpha0: None,
+            batch_law: BatchLaw::Auto,
+            unused_threshold: None,
         }
     }
-    groups
 }
 
-/// `(cluster, vector)` pairs of an assignment, sorted. Sorting fixes each cluster's summation
-/// order (ascending vector id), so results do not depend on the thread count.
-fn sorted_pairs(ids: impl Iterator<Item = u32>, assignments: &[(f32, usize)]) -> Vec<(u32, u32)> {
-    let mut pairs: Vec<(u32, u32)> = assignments
-        .iter()
-        .zip(ids)
-        .map(|(&(_, c), i)| (c as u32, i))
-        .collect();
-    pairs.par_sort_unstable();
-    pairs
-}
-
-/// Mini-batch EMA k-means. Build one with [`EMeansBuilder`]; train it through
-/// [`Clustering`].
-#[derive(Clone, Debug)]
-pub struct EMeans {
-    nepochs: f64,
-    batch_size: Option<usize>,
-    alpha0: Option<f64>,
-    batch_law: BatchLaw,
-    unused_threshold: Option<f32>,
-    seed: Option<u64>,
-    verbose: bool,
-    spherical: bool,
-    index_refresh: IndexRefresh,
-}
-
-impl EMeans {
-    /// The recipe this configuration resolves to for `n` vectors of dimension `d` and `k`
+impl EMeansParams {
+    /// The recipe these parameters resolve to for `n` vectors of dimension `d` and `k`
     /// clusters. Training uses exactly this recipe.
     pub fn recipe(&self, n: usize, k: usize, d: usize) -> EMeansRecipe {
         EMeansRecipe::resolve(
@@ -312,211 +297,163 @@ impl EMeans {
             self.unused_threshold,
         )
     }
+}
 
-    /// The shared training loop; `assign` assigns one batch against the current centroids.
-    #[allow(clippy::too_many_arguments)]
-    fn run<D, G>(
-        &self,
-        dataset: &D,
-        k: usize,
-        weights: Option<&[f32]>,
-        encoder: &G::Encoder,
-        assign: &mut BatchAssigner<'_, G>,
-        refine: &(impl Fn(&[u32], &mut D::Vector) + Sync),
-    ) -> G
-    where
-        D: MeanDataset + Sync,
-        G: DatasetGrowable,
-        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
-    {
-        let n = dataset.len();
-        let d = dataset.input_dim();
-        if n == k {
-            if self.verbose {
-                println!("WARNING: number of training data is equal to the number of clusters.");
-            }
-            let all: Vec<D::Vector> = (0..n as u32).map(|i| dataset.vector(i)).collect();
-            return KMeans::to_dataset(&all, encoder);
-        }
-        assert!(k > 0, "k must be positive");
-        assert!(
-            k < n,
-            "k ({k}) must not exceed the number of training vectors ({n})"
+/// Runs e-means and returns its centroids after the closing means.
+pub(super) fn fit<D, G>(
+    run: &Run<'_, D, G>,
+    params: &EMeansParams,
+    assign: &mut Assign<'_, G>,
+    refine: &(impl Fn(&[u32], &mut D::Vector) + Sync),
+) -> G
+where
+    D: MeanDataset + Sync,
+    G: DatasetGrowable,
+    for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>,
+{
+    let dataset = run.dataset;
+    let (n, k) = (dataset.len(), run.k);
+    let recipe = params.recipe(n, k, dataset.input_dim());
+    let seed = run.seed;
+
+    if run.verbose {
+        println!(
+            "E-means: {} epochs (batch {}, alpha0 {:.4}, {} updates, law {:?}, tau {}). \
+             Please cite Bessa et al., arXiv:2611.09501.",
+            params.nepochs,
+            recipe.batch_size,
+            recipe.alpha0,
+            recipe.total_steps,
+            recipe.batch_law,
+            recipe.unused_threshold,
         );
-        if let Some(w) = weights {
-            assert_eq!(
-                w.len(),
-                n,
-                "weights must have one entry per training vector"
-            );
-        }
-        let recipe = self.recipe(n, k, d);
-        let seed = self.seed.unwrap_or_else(|| rand::thread_rng().r#gen());
+    }
 
-        if self.verbose {
-            println!(
-                "E-means: clustering {n} points ({} nnz, dim {d}) to {k} clusters, {} epochs \
-                 (batch {}, alpha0 {:.4}, {} updates, law {:?}, tau {}{}). \
-                 Please cite Bessa et al., arXiv:2611.09501.",
-                dataset.nnz(),
-                self.nepochs,
-                recipe.batch_size,
-                recipe.alpha0,
-                recipe.total_steps,
-                recipe.batch_law,
-                recipe.unused_threshold,
-                if self.spherical { ", spherical" } else { "" }
-            );
-        }
+    let mut centroids = run.initial_centroids(&mut StdRng::seed_from_u64(seed.wrapping_add(1)));
+    let mut usage = vec![INIT_USAGE; k];
+    let mut split_rng = StdRng::seed_from_u64(seed);
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    // Cluster of every vector in the last epoch, for the closing means.
+    let mut last_assignment = vec![u32::MAX; n];
+    let mut pass_counts = vec![0f64; k];
+    let mut n_splits = 0usize;
+    let mut revived_last = false;
+    let mut step = 0usize;
+    let n_passes = recipe.epoch_rows.len();
+    let start = Instant::now();
 
-        // Initialization: k distinct training vectors.
-        let mut init_rng = StdRng::seed_from_u64(seed.wrapping_add(1));
-        let mut centroids: Vec<D::Vector> = index::sample(&mut init_rng, n, k)
-            .into_iter()
-            .map(|i| dataset.vector(i as u32))
-            .collect();
-        if self.spherical {
-            centroids
-                .iter_mut()
-                .for_each(|c| KMeans::normalize_l2(c.as_mut()));
-        }
-        let mut usage = vec![INIT_USAGE; k];
-        let mut split_rng = StdRng::seed_from_u64(seed);
-        let mut order: Vec<u32> = (0..n as u32).collect();
-        // Cluster of every vector in the last epoch, for the closing means.
-        let mut last_assignment = vec![u32::MAX; n];
-        let mut pass_counts = vec![0f64; k];
-        let mut n_splits = 0usize;
-        let mut revived_last = false;
-        let mut step = 0usize;
-        let n_passes = recipe.epoch_rows.len();
-        let start = Instant::now();
+    for (epoch, &rows) in recipe.epoch_rows.iter().enumerate() {
+        let last = epoch + 1 == n_passes;
+        // Reset to the identity so each epoch's order depends only on (seed, epoch).
+        order
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, o)| *o = i as u32);
+        order.shuffle(&mut StdRng::seed_from_u64(epoch_seed(seed, epoch)));
+        pass_counts.iter_mut().for_each(|c| *c = 0.0);
+        let mut objective = 0f64;
+        let splits_before = n_splits;
+        let mut assign_time = Duration::ZERO;
+        let mut update_time = Duration::ZERO;
 
-        for (epoch, &rows) in recipe.epoch_rows.iter().enumerate() {
-            let last = epoch + 1 == n_passes;
-            // Reset to the identity so each epoch's order depends only on (seed, epoch).
-            order
-                .iter_mut()
-                .enumerate()
-                .for_each(|(i, o)| *o = i as u32);
-            order.shuffle(&mut StdRng::seed_from_u64(epoch_seed(seed, epoch)));
-            pass_counts.iter_mut().for_each(|c| *c = 0.0);
-            let mut objective = 0f64;
-            let splits_before = n_splits;
-            let mut assign_time = Duration::ZERO;
-            let mut update_time = Duration::ZERO;
+        for (b, batch) in order[..rows].chunks(recipe.batch_size).enumerate() {
+            let ctx = UpdateCtx {
+                update: step,
+                epoch,
+                epoch_start: b == 0,
+                centroids_jumped: revived_last,
+            };
+            let t0 = Instant::now();
+            // Assign against a snapshot of the centroids (their unit directions in spherical
+            // mode; the moving average itself runs on unnormalized positions).
+            let current: G = if run.spherical {
+                let mut unit = centroids.clone();
+                run.normalize_if_spherical(&mut unit);
+                run.to_dataset(&unit)
+            } else {
+                run.to_dataset(&centroids)
+            };
+            let assignments = assign(&current, ctx, Some(batch));
+            drop(current);
+            assign_time += t0.elapsed();
 
-            for (b, batch) in order[..rows].chunks(recipe.batch_size).enumerate() {
-                let ctx = UpdateCtx {
-                    update: step,
-                    epoch,
-                    epoch_start: b == 0,
-                    centroids_jumped: revived_last,
-                };
-                let t0 = Instant::now();
-                let current: G = if self.spherical {
-                    let unit: Vec<D::Vector> = centroids
-                        .iter()
-                        .map(|c| {
-                            let mut c = c.clone();
-                            KMeans::normalize_l2(c.as_mut());
-                            c
-                        })
-                        .collect();
-                    KMeans::to_dataset(&unit, encoder)
-                } else {
-                    KMeans::to_dataset(&centroids, encoder)
-                };
-                let assignments = assign(&current, ctx, batch);
-                drop(current);
-                assign_time += t0.elapsed();
-
-                let t0 = Instant::now();
-                objective += assignments.iter().map(|a| a.0 as f64).sum::<f64>();
-                if last {
-                    for (&i, &(_, c)) in batch.iter().zip(&assignments) {
-                        last_assignment[i as usize] = c as u32;
-                    }
+            let t0 = Instant::now();
+            objective += assignments.iter().map(|a| a.0 as f64).sum::<f64>();
+            if last {
+                for (&i, &(_, c)) in batch.iter().zip(&assignments) {
+                    last_assignment[i as usize] = c as u32;
                 }
-                let alpha = scheduled_alpha(recipe.alpha0, step, recipe.total_steps);
-                apply_batch(
-                    dataset,
-                    weights,
-                    batch,
-                    &assignments,
-                    alpha,
+            }
+            let alpha = scheduled_alpha(recipe.alpha0, step, recipe.total_steps);
+            apply_batch(
+                dataset,
+                run.weights,
+                batch,
+                &assignments,
+                alpha,
+                &mut centroids,
+                &mut usage,
+                &mut pass_counts,
+                refine,
+            );
+            revived_last = false;
+            if (step + 1).is_multiple_of(CHECK_UNUSED_EVERY) {
+                let splits = revive_unused(
                     &mut centroids,
                     &mut usage,
-                    &mut pass_counts,
-                    refine,
+                    recipe.unused_threshold,
+                    &mut split_rng,
                 );
-                revived_last = false;
-                if (step + 1).is_multiple_of(CHECK_UNUSED_EVERY) {
-                    let splits = revive_unused(
-                        &mut centroids,
-                        &mut usage,
-                        recipe.unused_threshold,
-                        &mut split_rng,
-                    );
-                    n_splits += splits;
-                    revived_last = splits > 0;
-                }
-                update_time += t0.elapsed();
-                step += 1;
+                n_splits += splits;
+                revived_last = splits > 0;
             }
-
-            if self.verbose {
-                let sq: f64 = pass_counts.iter().map(|c| c * c).sum();
-                let total: f64 = pass_counts.iter().sum();
-                let imbalance = k as f64 * sq / (total * total);
-                println!(
-                    "  Epoch {}/{n_passes} ({rows} rows, {} updates, {:.2?}): objective={objective:.6e} \
-                     imbalance={imbalance:.4} splits={} assign={assign_time:.2?} update={update_time:.2?}",
-                    epoch + 1,
-                    recipe.epoch_steps[epoch],
-                    start.elapsed(),
-                    n_splits - splits_before,
-                );
-            }
+            update_time += t0.elapsed();
+            step += 1;
         }
 
-        // Closing means (Algorithm 1, line 12): centroids that received vectors in the last
-        // epoch become the exact mean of those vectors; the others keep their EMA position.
-        let visited = last_assignment
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| **c != u32::MAX);
-        let mut pairs: Vec<(u32, u32)> = visited.map(|(i, &c)| (c, i as u32)).collect();
-        pairs.par_sort_unstable();
-        let groups = group_by_cluster(&pairs, k);
-        let members_of =
-            |(s, t): (usize, usize)| -> Vec<u32> { pairs[s..t].iter().map(|p| p.1).collect() };
-        centroids
-            .par_iter_mut()
-            .zip(groups.into_par_iter())
-            .for_each(|(centroid, group)| {
-                let Some(group) = group else { return };
-                let members = members_of(group);
-                let count: f32 = members
-                    .iter()
-                    .map(|&i| weights.map_or(1.0, |w| w[i as usize]))
-                    .sum();
-                if count > 0.0 {
-                    *centroid = dataset.mean(&members, weights);
-                    refine(&members, centroid);
-                }
-            });
-        if self.spherical {
-            centroids
-                .iter_mut()
-                .for_each(|c| KMeans::normalize_l2(c.as_mut()));
+        if run.verbose {
+            println!(
+                "  Epoch {}/{n_passes} ({rows} rows, {} updates, {:.2?}): objective={objective:.6e} \
+                 imbalance={:.4} splits={} assign={assign_time:.2?} update={update_time:.2?}",
+                epoch + 1,
+                recipe.epoch_steps[epoch],
+                start.elapsed(),
+                imbalance_factor(pass_counts.iter().copied()),
+                n_splits - splits_before,
+            );
         }
-        KMeans::to_dataset(&centroids, encoder)
     }
+
+    // Closing means (Algorithm 1, line 12): centroids that received vectors in the last
+    // epoch become the exact mean of those vectors; the others keep their EMA position.
+    let (visited, visited_assignments): (Vec<u32>, Vec<(f32, usize)>) = last_assignment
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c != u32::MAX)
+        .map(|(i, &c)| (i as u32, (0.0, c as usize)))
+        .unzip();
+    let groups = ClusterGroups::new(Some(&visited), &visited_assignments, k);
+    centroids
+        .par_iter_mut()
+        .zip(run.means(&groups).into_par_iter())
+        .enumerate()
+        .for_each(|(c, (centroid, mean))| {
+            if let Some((mean, count)) = mean
+                && count > 0.0
+            {
+                *centroid = mean;
+                refine(groups.members(c), centroid);
+            }
+        });
+    run.normalize_if_spherical(&mut centroids);
+    run.to_dataset(&centroids)
 }
 
 /// Applies one batch's EMA update (Algorithm 1, line 8) to `centroids` and `usage`, refines
 /// every moved centroid with its batch members, and adds the batch's counts to the epoch totals.
+///
+/// At `alpha >= 1` the update replaces: a touched cluster's centroid becomes its batch mean and
+/// its mass the batch count, and untouched clusters keep their mass (faiss `replace_usage`).
 #[allow(clippy::too_many_arguments)]
 fn apply_batch<D>(
     dataset: &D,
@@ -531,36 +468,38 @@ fn apply_batch<D>(
 ) where
     D: MeanDataset + Sync,
 {
-    let pairs = sorted_pairs(batch.iter().copied(), assignments);
-    let groups = group_by_cluster(&pairs, centroids.len());
+    let groups = ClusterGroups::new(Some(batch), assignments, centroids.len());
     let replace = alpha >= 1.0;
     let alpha = alpha as f32;
-    let decay = if replace { 0.0 } else { 1.0 - alpha };
 
+    // One parallel pass computes each cluster's mean and applies its update: mini-batches can
+    // be small (hundreds of rows), so a separate pass for the means costs a measurable
+    // share of every update.
     let counts: Vec<f32> = centroids
         .par_iter_mut()
         .zip(usage.par_iter_mut())
-        .zip(groups.into_par_iter())
-        .map(|((centroid, mass), group)| {
-            *mass *= decay;
-            let Some((s, t)) = group else { return 0.0 };
-            let members: Vec<u32> = pairs[s..t].iter().map(|p| p.1).collect();
+        .enumerate()
+        .map(|(c, (centroid, mass))| {
+            let members = groups.members(c);
             let count: f32 = members
                 .iter()
                 .map(|&i| weights.map_or(1.0, |w| w[i as usize]))
                 .sum();
-            if count <= 0.0 {
+            if members.is_empty() || count <= 0.0 {
+                if !replace {
+                    *mass *= 1.0 - alpha;
+                }
                 return 0.0;
             }
-            *mass += alpha * count;
+            let mean = dataset.mean(members, weights);
+            *mass = if replace { 0.0 } else { *mass * (1.0 - alpha) } + alpha * count;
             let weight = alpha * count / *mass;
-            let mean = dataset.mean(&members, weights);
             if weight >= 1.0 {
                 *centroid = mean;
             } else {
                 dataset.lerp(centroid, &mean, weight);
             }
-            refine(&members, centroid);
+            refine(members, centroid);
             count
         })
         .collect();
@@ -638,197 +577,11 @@ fn revive_unused<V: AsMut<[f32]> + Clone>(
     n_split
 }
 
-impl Clustering for EMeans {
-    fn train_refined<D, G>(
-        &self,
-        training_dataset: &D,
-        k: usize,
-        weights: Option<Vec<f32>>,
-        centroid_encoder: G::Encoder,
-        refine: impl Fn(&[u32], &mut D::Vector) + Sync,
-    ) -> G
-    where
-        D: MeanDataset + Sync,
-        G: DatasetGrowable + Clone + Sync,
-        G::Encoder: VectorEncoder<QueryParams = ()>,
-        <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
-        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>
-            + Into<<G::Encoder as VectorEncoder>::QueryVector<'a>>,
-    {
-        // Exact assignment with the same kernel as `KMeans::compute_assignments`.
-        let mut assign = |current: &G, _ctx: UpdateCtx, batch: &[u32]| {
-            KMeans::compute_assignments_of(training_dataset, Some(batch), current)
-        };
-        self.run(
-            training_dataset,
-            k,
-            weights.as_deref(),
-            &centroid_encoder,
-            &mut assign,
-            &refine,
-        )
-    }
-
-    /// Assigns through an index over the centroids, maintained with this configuration's
-    /// [`IndexRefresh`] policy (default: refreshed for every mini-batch). Distances are
-    /// always exact distances to the current centroids.
-    fn train_with_index_refined<D, G, Q>(
-        &self,
-        training_dataset: &D,
-        k: usize,
-        weights: Option<Vec<f32>>,
-        centroid_encoder: G::Encoder,
-        build_centroid_index: impl CentroidIndexBuilder<G, Index = Q>,
-        search_params: &Q::SearchParams,
-        refine: impl Fn(&[u32], &mut D::Vector) + Sync,
-    ) -> G
-    where
-        D: MeanDataset + Sync,
-        G: DatasetGrowable + Clone + Sync,
-        G::Encoder: VectorEncoder<QueryParams = ()>,
-        <G::Encoder as VectorEncoder>::Distance: Distance + From<f32>,
-        for<'a> &'a D::Vector: Into<<G::Encoder as VectorEncoder>::InputVector<'a>>
-            + Into<<G::Encoder as VectorEncoder>::QueryVector<'a>>,
-        Q: Index + Sync,
-        Q::SearchParams: Sync,
-        for<'a> &'a D::Vector: Into<Q::Query<'a>>,
-    {
-        let mut assigner = IndexedAssigner::new(build_centroid_index, self.index_refresh);
-        let mut assign = |current: &G, ctx: UpdateCtx, batch: &[u32]| {
-            assigner.prepare(ctx, || current.clone());
-            assigner.assign(training_dataset, Some(batch), current, search_params)
-        };
-        let centroids = self.run(
-            training_dataset,
-            k,
-            weights.as_deref(),
-            &centroid_encoder,
-            &mut assign,
-            &refine,
-        );
-        if self.verbose {
-            println!(
-                "  Centroid index: {} builds + {} refreshes, {:.2?} total",
-                assigner.builds, assigner.refreshes, assigner.maintenance_time
-            );
-        }
-        centroids
-    }
-}
-
-/// Builder for [`EMeans`]. Every option defaults to the faiss `NumpyEmeans` default.
-#[derive(Clone, Debug)]
-pub struct EMeansBuilder {
-    nepochs: f64,
-    batch_size: Option<usize>,
-    alpha0: Option<f64>,
-    batch_law: BatchLaw,
-    unused_threshold: Option<f32>,
-    seed: Option<u64>,
-    verbose: bool,
-    spherical: bool,
-    index_refresh: IndexRefresh,
-}
-
-impl Default for EMeansBuilder {
-    fn default() -> Self {
-        Self {
-            nepochs: 5.0,
-            batch_size: None,
-            alpha0: None,
-            batch_law: BatchLaw::Auto,
-            unused_threshold: None,
-            seed: None,
-            verbose: false,
-            spherical: false,
-            index_refresh: IndexRefresh::default(),
-        }
-    }
-}
-
-impl EMeansBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Epoch budget `T` (default 5). Fractional values add a partial epoch.
-    pub fn nepochs(mut self, nepochs: f64) -> Self {
-        self.nepochs = nepochs;
-        self
-    }
-
-    /// Fixes the batch size `B` instead of using the batch law. The step law still sets
-    /// `alpha0` for this `B` unless [`alpha0`](Self::alpha0) is also given.
-    pub fn batch_size(mut self, batch_size: Option<usize>) -> Self {
-        self.batch_size = batch_size;
-        self
-    }
-
-    /// Fixes the initial EMA step instead of using the step law.
-    pub fn alpha0(mut self, alpha0: Option<f64>) -> Self {
-        self.alpha0 = alpha0;
-        self
-    }
-
-    /// Chooses the batch law used when no batch size is given (default [`BatchLaw::Auto`]).
-    pub fn batch_law(mut self, batch_law: BatchLaw) -> Self {
-        self.batch_law = batch_law;
-        self
-    }
-
-    /// Revival threshold `tau` (`Some(0.0)` disables revival). `None` (default) is 0.1, or 0
-    /// when `d <= 2`.
-    pub fn unused_threshold(mut self, unused_threshold: Option<f32>) -> Self {
-        self.unused_threshold = unused_threshold;
-        self
-    }
-
-    /// Fixes the RNG seed. `None` (default) draws one from entropy.
-    pub fn seed(mut self, seed: Option<u64>) -> Self {
-        self.seed = seed;
-        self
-    }
-
-    pub fn verbose(mut self, verbose: bool) -> Self {
-        self.verbose = verbose;
-        self
-    }
-
-    /// Spherical e-means: assign against unit-norm centroid directions and return unit-norm
-    /// centroids. The EMA itself runs on unnormalized positions, as in faiss.
-    pub fn spherical(mut self, spherical: bool) -> Self {
-        self.spherical = spherical;
-        self
-    }
-
-    /// Centroid-index maintenance for [`train_with_index`](Clustering::train_with_index):
-    /// how often the index is refreshed (in mini-batch updates or epochs) and how many of its
-    /// results are re-ranked exactly. Default: refresh every update, top result only.
-    pub fn index_refresh(mut self, index_refresh: IndexRefresh) -> Self {
-        self.index_refresh = index_refresh;
-        self
-    }
-
-    pub fn build(self) -> EMeans {
-        EMeans {
-            nepochs: self.nepochs,
-            batch_size: self.batch_size,
-            alpha0: self.alpha0,
-            batch_law: self.batch_law,
-            unused_threshold: self.unused_threshold,
-            seed: self.seed,
-            verbose: self.verbose,
-            spherical: self.spherical,
-            index_refresh: self.index_refresh,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Dataset;
-    use crate::clustering::{KMeansBuilder, sparse_centroid_pruning};
+    use crate::clustering::{KMeans, KMeansBuilder, Solver, sparse_centroid_pruning};
     use crate::core::flat_index::FlatIndex;
     use crate::core::vector::{DenseVectorOwned, DenseVectorView, SparseVectorView};
     use crate::encoders::sparse_scalar::PlainSparseQuantizer;
@@ -842,6 +595,16 @@ mod tests {
 
     fn enc(d: usize) -> PlainDenseQuantizer<f32, SquaredEuclideanDistance> {
         PlainDenseQuantizer::new(d)
+    }
+
+    /// A k-means builder with the e-means solver and these parameters.
+    fn emeans_with(params: EMeansParams) -> KMeansBuilder {
+        KMeansBuilder::new().solver(Solver::EMeans(params))
+    }
+
+    /// A k-means builder with the default e-means solver.
+    fn emeans() -> KMeansBuilder {
+        emeans_with(EMeansParams::default())
     }
 
     // ---- recipe: values hand-derived from faiss `base.py` ---------------------
@@ -998,6 +761,62 @@ mod tests {
         assert_ne!(centroids[0].values(), centroids[1].values());
     }
 
+    // ---- the EMA update --------------------------------------------------------
+
+    #[test]
+    fn replacing_update_leaves_untouched_mass_alone() {
+        // At alpha = 1 the update replaces: a touched cluster takes its batch mean, and its
+        // batch count as mass; an untouched cluster keeps its mass (faiss `replace_usage`).
+        let ds = Plain::from_raw(
+            vec![0.0, 0.0, 2.0, 0.0, 9.0, 9.0].into_boxed_slice(),
+            3,
+            enc(2),
+        );
+        let noop = |_: &[u32], _: &mut DenseVectorOwned<f32>| {};
+        let batch = [1, 0];
+        let assignments = [(0.0, 0), (0.0, 0)];
+        let mut centroids = rows(&[1.0, 1.0, 5.0, 5.0], 2);
+        let mut usage = vec![3.0, 7.0];
+        let mut pass = vec![0.0; 2];
+        apply_batch(
+            &ds,
+            None,
+            &batch,
+            &assignments,
+            1.0,
+            &mut centroids,
+            &mut usage,
+            &mut pass,
+            &noop,
+        );
+        assert_eq!(usage, vec![2.0, 7.0]);
+        assert_eq!(centroids[0].values(), &[1.0, 0.0]);
+        assert_eq!(centroids[1].values(), &[5.0, 5.0]);
+        assert_eq!(pass, vec![2.0, 0.0]);
+
+        // Below 1 every mass decays, and the touched centroid moves part of the way.
+        let mut centroids = rows(&[1.0, 1.0, 5.0, 5.0], 2);
+        let mut usage = vec![3.0, 8.0];
+        apply_batch(
+            &ds,
+            None,
+            &batch,
+            &assignments,
+            0.5,
+            &mut centroids,
+            &mut usage,
+            &mut pass,
+            &noop,
+        );
+        // Mass 0.5 * 3 + 0.5 * 2 = 2.5; weight 0.5 * 2 / 2.5 = 0.4 towards the mean (1, 0).
+        assert_eq!(usage, vec![2.5, 4.0]);
+        let c = centroids[0].values();
+        assert!(
+            (c[0] - 1.0).abs() < 1e-6 && (c[1] - 0.6).abs() < 1e-6,
+            "{c:?}"
+        );
+    }
+
     // ---- end-to-end ------------------------------------------------------------
 
     /// `n_blobs` tight Gaussian blobs in `d` dimensions, centers far apart. Returns the
@@ -1053,7 +872,7 @@ mod tests {
     #[test]
     fn train_recovers_blobs() {
         let (ds, truth) = blobs(8, 500, 16, 7);
-        let em = EMeansBuilder::new().seed(Some(3)).build();
+        let em = emeans().seed(Some(3)).build();
         let c: Grow = em.train(&ds, 8, None, enc(16));
         assert_eq!(c.len(), 8);
         assert_recovers(&labels_of(&ds, &c), &truth, 8);
@@ -1062,7 +881,12 @@ mod tests {
     #[test]
     fn train_is_deterministic_for_a_seed_and_across_thread_counts() {
         let (ds, _) = blobs(5, 400, 24, 11);
-        let em = EMeansBuilder::new().seed(Some(42)).nepochs(2.5).build();
+        let em = emeans_with(EMeansParams {
+            nepochs: 2.5,
+            ..Default::default()
+        })
+        .seed(Some(42))
+        .build();
         let run = |threads: usize| -> Grow {
             rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -1078,7 +902,7 @@ mod tests {
     #[test]
     fn n_equal_k_returns_the_data() {
         let (ds, _) = blobs(2, 3, 4, 1);
-        let c: Grow = EMeansBuilder::new().build().train(&ds, 6, None, enc(4));
+        let c: Grow = emeans().build().train(&ds, 6, None, enc(4));
         assert_eq!(c.values(), ds.values());
     }
 
@@ -1109,7 +933,7 @@ mod tests {
             truth.len(),
             PlainDenseQuantizer::new(d),
         );
-        let em = EMeansBuilder::new().seed(Some(2)).spherical(true).build();
+        let em = emeans().seed(Some(2)).spherical(true).build();
         let c: PlainDenseDatasetGrowable<f32, DotProduct> =
             em.train(&ds, 4, None, PlainDenseQuantizer::new(d));
         for row in c.values().chunks_exact(d) {
@@ -1155,7 +979,7 @@ mod tests {
             n,
             PlainDenseQuantizer::new(d),
         );
-        let em = EMeansBuilder::new().seed(Some(5)).build();
+        let em = emeans().seed(Some(5)).build();
         let base = objective(&ds, &em.train(&ds, k, None, enc(d)));
         let c32: Grow = em.train(&ds16, k, None, enc(d));
         let o32 = objective(&ds, &c32);
@@ -1177,7 +1001,7 @@ mod tests {
             3,
             enc(2),
         );
-        let em = EMeansBuilder::new().seed(Some(0)).build();
+        let em = emeans().seed(Some(0)).build();
         let c: Grow = em.train(&ds, 1, Some(vec![1.0, 8.0, 1.0]), enc(2));
         let v = c.values();
         assert!(
@@ -1192,7 +1016,7 @@ mod tests {
         // its members must be valid, ascending training ids.
         let (ds, _) = blobs(4, 200, 6, 8);
         let n = ds.len() as u32;
-        let em = EMeansBuilder::new().seed(Some(1)).build();
+        let em = emeans().seed(Some(1)).build();
         let c: Grow = em.train_refined(&ds, 4, None, enc(6), |members, c| {
             assert!(members.windows(2).all(|w| w[0] < w[1]) && members.iter().all(|&i| i < n));
             *c.as_mut().last_mut().unwrap() = 0.0;
@@ -1217,10 +1041,7 @@ mod tests {
                 .seed(Some(1))
                 .build()
                 .train(&ds, k, None, enc(d));
-        let em: Grow = EMeansBuilder::new()
-            .seed(Some(1))
-            .build()
-            .train(&ds, k, None, enc(d));
+        let em: Grow = emeans().seed(Some(1)).build().train(&ds, k, None, enc(d));
         let (ol, oe) = (objective(&ds, &lloyd), objective(&ds, &em));
         assert!(oe <= 1.03 * ol, "e-means objective {oe} vs Lloyd {ol}");
     }
@@ -1246,7 +1067,7 @@ mod tests {
             growable.push(SparseVectorView::new(&comps, &vals));
         }
         let ds: crate::PlainSparseDataset<u16, f32, DotProduct> = growable.into();
-        let em = EMeansBuilder::new().seed(Some(1)).spherical(true).build();
+        let em = emeans().seed(Some(1)).spherical(true).build();
         let c: PlainSparseDatasetGrowable<u16, f32, DotProduct> =
             em.train(&ds, 2, None, PlainSparseQuantizer::new(64, 64));
         let found: Vec<usize> = KMeans::compute_assignments(&ds, &c)
@@ -1270,11 +1091,11 @@ mod tests {
         );
     }
 
-    // ---- the Clustering seam ---------------------------------------------------
+    // ---- callers that take a KMeans ---------------------------------------------------
 
     #[test]
     fn pq_trains_with_emeans() {
-        // Product quantization through `train_with_clustering` must reconstruct about as well
+        // Product quantization through `train_with_kmeans` with e-means must reconstruct about as well
         // as the default k-means codebooks (e-means usually reconstructs slightly better).
         use crate::core::vector_encoder::DenseVectorEncoder;
         use crate::encoders::pq::ProductQuantizer;
@@ -1301,9 +1122,8 @@ mod tests {
                 .sum::<f64>()
                 / n as f64
         };
-        let em = EMeansBuilder::new().seed(Some(2)).build();
-        let pq_em =
-            ProductQuantizer::<4, SquaredEuclideanDistance>::train_with_clustering(&ds, &em);
+        let em = emeans().seed(Some(2)).build();
+        let pq_em = ProductQuantizer::<4, SquaredEuclideanDistance>::train_with_kmeans(&ds, &em);
         let pq_km = ProductQuantizer::<4, SquaredEuclideanDistance>::train_with_kmeans_options(
             &ds,
             25,

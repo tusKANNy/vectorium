@@ -1,10 +1,10 @@
-//! Index-accelerated nearest-centroid assignment, shared by every [`Clustering`] algorithm.
+//! Index-accelerated nearest-centroid assignment, shared by every k-means [`Solver`].
 //!
-//! [`Clustering::train_with_index`] assigns training vectors through an index over the current
+//! [`KMeans::train_with_index`] assigns training vectors through an index over the current
 //! centroids. Clustering moves the centroids after every *update* (a Lloyd iteration, an
-//! e-means mini-batch), so the index must be kept in step with them. Two knobs control the
+//! e-means mini-batch), so the index must be kept in step with them. Two choices control the
 //! trade-off between index maintenance and assignment accuracy, identically for every
-//! algorithm:
+//! solver:
 //!
 //! * **When** the index is refreshed — [`IndexRefresh::every`], counted in updates or in
 //!   epochs (full passes over the training set). For Lloyd an update *is* an epoch; for
@@ -14,13 +14,15 @@
 //!   an IVF over the centroids keeps its coarse quantizer and only re-files centroids into
 //!   lists, as faiss's e-means IVF assignment does.
 //!
-//! Between refreshes the index is stale: it was built over older centroid positions. Each
-//! vector's top [`IndexRefresh::candidates`] index results are therefore re-ranked by their
-//! exact distance to the **current** centroids, under the centroids' own metric, so staleness
-//! can only change *which* centroids are considered, never the distances clustering sees.
+//! Between refreshes the index is stale: it was built over older centroid positions, so its top
+//! result may no longer be the nearest centroid. Each vector takes the index's top result, and
+//! its distance is recomputed exactly against the **current** centroid under the centroids' own
+//! metric, so staleness can only change *which* centroid a vector picks, never the distances
+//! clustering sees. Splits and revivals, which move centroids furthest, always force a refresh;
+//! otherwise the refresh cadence is the knob for staleness.
 //!
-//! [`Clustering`]: super::Clustering
-//! [`Clustering::train_with_index`]: super::Clustering::train_with_index
+//! [`Solver`]: super::Solver
+//! [`KMeans::train_with_index`]: super::KMeans::train_with_index
 
 use crate::core::dataset::MeanDataset;
 use crate::core::distances::Distance;
@@ -61,7 +63,7 @@ where
 
 /// How often the centroid index is refreshed during [`train_with_index`].
 ///
-/// [`train_with_index`]: super::Clustering::train_with_index
+/// [`train_with_index`]: super::KMeans::train_with_index
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefreshEvery {
     /// Every `n` updates (Lloyd iterations or e-means mini-batches).
@@ -70,25 +72,22 @@ pub enum RefreshEvery {
     Epochs(usize),
 }
 
-/// Centroid-index maintenance policy for [`train_with_index`], shared by all algorithms.
+/// Centroid-index maintenance policy for [`train_with_index`], shared by all solvers.
 ///
-/// The default — refresh every update, use only the top result — is the classic behaviour:
-/// a fresh index for every Lloyd iteration or e-means batch.
+/// The default — refresh every update — is the classic behaviour: a fresh index for every
+/// Lloyd iteration or e-means batch.
 ///
-/// [`train_with_index`]: super::Clustering::train_with_index
+/// [`train_with_index`]: super::KMeans::train_with_index
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexRefresh {
     /// Refresh cadence.
     pub every: RefreshEvery,
-    /// Index results per vector re-ranked by exact distance to the current centroids (>= 1).
-    pub candidates: usize,
 }
 
 impl Default for IndexRefresh {
     fn default() -> Self {
         Self {
             every: RefreshEvery::Updates(1),
-            candidates: 1,
         }
     }
 }
@@ -98,7 +97,6 @@ impl IndexRefresh {
     pub fn every_updates(n: usize) -> Self {
         Self {
             every: RefreshEvery::Updates(n.max(1)),
-            ..Self::default()
         }
     }
 
@@ -106,14 +104,7 @@ impl IndexRefresh {
     pub fn every_epochs(n: usize) -> Self {
         Self {
             every: RefreshEvery::Epochs(n.max(1)),
-            ..Self::default()
         }
-    }
-
-    /// Re-rank this many index results per vector against the current centroids.
-    pub fn with_candidates(mut self, candidates: usize) -> Self {
-        self.candidates = candidates.max(1);
-        self
     }
 }
 
@@ -191,9 +182,8 @@ impl<G, B: CentroidIndexBuilder<G>> IndexedAssigner<G, B> {
     }
 
     /// Assigns the training vectors `ids` (all of them when `None`) to their nearest
-    /// `current` centroid: the best of their top index results, re-ranked under `current`'s
-    /// metric. Returns `(distance, centroid)` per vector, in `ids` order. Of candidates at
-    /// equal distance, the lowest centroid id wins.
+    /// `current` centroid: the index's top result, with its distance recomputed exactly under
+    /// `current`'s metric. Returns `(distance, centroid)` per vector, in `ids` order.
     pub fn assign<D>(
         &self,
         dataset: &D,
@@ -215,25 +205,19 @@ impl<G, B: CentroidIndexBuilder<G>> IndexedAssigner<G, B> {
             .index
             .as_ref()
             .expect("prepare() must run before assign()");
-        let candidates = self.policy.candidates.clamp(1, current.len().max(1));
-        super::kmeans::KMeans::assign_each(dataset, ids, |query| {
-            let evaluator = current.encoder().query_evaluator(query.into(), &());
-            index
-                .search(query.into(), candidates, search_params)
-                .into_iter()
-                .map(|r| {
-                    let c = r.vector as usize;
-                    (evaluator.compute_distance(current.get(c as VectorId)), c)
-                })
-                .reduce(|best, next| {
-                    if next.0.is_better_than(&best.0) || (next.0 == best.0 && next.1 < best.1) {
-                        next
-                    } else {
-                        best
-                    }
-                })
-                .map(|(d, c)| (d.distance(), c))
+        super::kmeans::assign_each(dataset, ids, |query| {
+            let c = index
+                .search(query.into(), 1, search_params)
+                .first()
                 .expect("centroid index returned no result during clustering assignment")
+                .vector as usize;
+            let evaluator = current.encoder().query_evaluator(query.into(), &());
+            (
+                evaluator
+                    .compute_distance(current.get(c as VectorId))
+                    .distance(),
+                c,
+            )
         })
     }
 }
@@ -241,7 +225,7 @@ impl<G, B: CentroidIndexBuilder<G>> IndexedAssigner<G, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clustering::{Clustering, ClusteringConfig, EMeansBuilder, KMeans, KMeansBuilder};
+    use crate::clustering::{EMeansParams, KMeans, KMeansBuilder, Solver};
     use crate::core::flat_index::FlatIndex;
     use crate::{
         DatasetGrowable, PlainDenseDataset, PlainDenseDatasetGrowable, PlainDenseQuantizer,
@@ -257,6 +241,11 @@ mod tests {
 
     fn enc(d: usize) -> PlainDenseQuantizer<f32, SquaredEuclideanDistance> {
         PlainDenseQuantizer::new(d)
+    }
+
+    /// A k-means builder with the e-means solver and these parameters.
+    fn emeans_with(params: EMeansParams) -> KMeansBuilder {
+        KMeansBuilder::new().solver(Solver::EMeans(params))
     }
 
     /// A flat-index builder that counts builds and refreshes.
@@ -330,12 +319,14 @@ mod tests {
         let k = 4;
         // Fix a small batch so there are many updates per epoch; revival off so only the
         // cadence triggers refreshes (revival forces one, see `centroid_jump_forces_refresh`).
-        let base = EMeansBuilder::new()
-            .seed(Some(1))
-            .nepochs(3.0)
-            .batch_size(Some(100))
-            .unused_threshold(Some(0.0));
-        let recipe = base.clone().build().recipe(ds.len(), k, 8);
+        let params = EMeansParams {
+            nepochs: 3.0,
+            batch_size: Some(100),
+            unused_threshold: Some(0.0),
+            ..Default::default()
+        };
+        let recipe = params.recipe(ds.len(), k, 8);
+        let base = emeans_with(params).seed(Some(1));
         let total = recipe.total_steps;
         assert_eq!(recipe.epoch_steps, vec![20, 20, 20]);
 
@@ -413,12 +404,14 @@ mod tests {
         assert!(refreshes > 0, "k-means splits must refresh the index");
 
         let b = Counting::default();
-        let em = EMeansBuilder::new()
-            .seed(Some(1))
-            .batch_size(Some(30))
-            .unused_threshold(Some(0.1))
-            .index_refresh(never)
-            .build();
+        let em = emeans_with(EMeansParams {
+            batch_size: Some(30),
+            unused_threshold: Some(0.1),
+            ..Default::default()
+        })
+        .seed(Some(1))
+        .index_refresh(never)
+        .build();
         let _: Grow = em.train_with_index(&dup, 6, None, enc(4), b.clone(), &());
         let (builds, refreshes) = b.counts();
         assert_eq!(builds, 1);
@@ -435,8 +428,9 @@ mod tests {
             .seed(Some(3))
             .build();
         let _: Grow = km.train_with_index(&ds, 4, None, enc(8), b.clone(), &());
-        // Each redo builds once and refreshes for iterations 1..6.
-        assert_eq!(b.counts(), (2, 10));
+        // Each redo builds once, refreshes for iterations 1..6, and once more for the pass
+        // that scores its final centroids against the other restart.
+        assert_eq!(b.counts(), (2, 12));
 
         let b = Counting::default();
         let km = KMeansBuilder::new()
@@ -472,37 +466,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn never_refreshed_index_with_all_candidates_is_exact() {
-        // Re-ranking every centroid exactly makes even a never-refreshed index exact, so
-        // the index path must reproduce flat training for both algorithms.
-        let ds = overlapping(3_000, 8, 1);
-        let k = 16;
-        let stale = IndexRefresh::every_updates(usize::MAX).with_candidates(k);
-        let km = KMeansBuilder::new().n_iter(6).seed(Some(2));
-        let flat: Grow = km.clone().build().train(&ds, k, None, enc(8));
-        let idx: Grow = km.index_refresh(stale).build().train_with_index(
-            &ds,
-            k,
-            None,
-            enc(8),
-            FlatIndex::from,
-            &(),
-        );
-        assert_close(&flat, &idx);
-        let em = EMeansBuilder::new().seed(Some(2)).nepochs(2.0);
-        let flat: Grow = em.clone().build().train(&ds, k, None, enc(8));
-        let idx: Grow = em.index_refresh(stale).build().train_with_index(
-            &ds,
-            k,
-            None,
-            enc(8),
-            FlatIndex::from,
-            &(),
-        );
-        assert_close(&flat, &idx);
-    }
-
     /// A stale index changes which local optimum a single run lands in (one different early
     /// assignment changes the trajectory), so compare means over several seeds rather than
     /// one run.
@@ -510,7 +473,7 @@ mod tests {
     fn moderately_stale_index_stays_close_to_flat_on_average() {
         let ds = overlapping(6_000, 8, 3);
         let k = 16;
-        let stale = IndexRefresh::every_updates(3).with_candidates(3);
+        let stale = IndexRefresh::every_updates(3);
         let seeds = 1..=5u64;
         let mean = |f: &dyn Fn(u64) -> Grow| -> f64 {
             seeds.clone().map(|s| objective(&ds, &f(s))).sum::<f64>() / 5.0
@@ -528,8 +491,8 @@ mod tests {
             )
         });
         assert!(idx <= 1.05 * flat, "kmeans mean {idx} vs flat {flat}");
-        let em = |s| EMeansBuilder::new().seed(Some(s));
-        let flat = mean(&|s| Clustering::train(&em(s).build(), &ds, k, None, enc(8)));
+        let em = |s| emeans_with(EMeansParams::default()).seed(Some(s));
+        let flat = mean(&|s| em(s).build().train(&ds, k, None, enc(8)));
         let idx = mean(&|s| {
             em(s).index_refresh(stale).build().train_with_index(
                 &ds,
@@ -554,20 +517,14 @@ mod tests {
     }
 
     #[test]
-    fn clustering_config_dispatches() {
+    fn both_solvers_recover_blobs_flat_and_indexed() {
         let (ds, truth) = blobs(4, 300, 8, 6);
-        for cfg in [
-            ClusteringConfig::from(KMeansBuilder::new().seed(Some(1))),
-            ClusteringConfig::from(EMeansBuilder::new().seed(Some(1))),
-        ] {
-            let c: Grow = cfg.train(&ds, 4, None, enc(8));
+        for solver in [Solver::default(), Solver::EMeans(EMeansParams::default())] {
+            let km = KMeansBuilder::new().solver(solver).seed(Some(1)).build();
+            let c: Grow = km.train(&ds, 4, None, enc(8));
             assert_recovers(&ds, &c, &truth, 4);
-            let c: Grow = cfg.train_with_index(&ds, 4, None, enc(8), FlatIndex::from, &());
+            let c: Grow = km.train_with_index(&ds, 4, None, enc(8), FlatIndex::from, &());
             assert_recovers(&ds, &c, &truth, 4);
         }
-        assert!(matches!(
-            ClusteringConfig::default(),
-            ClusteringConfig::KMeans(_)
-        ));
     }
 }

@@ -5,58 +5,36 @@ Newest entries go at the top of each section.
 
 ## [0.12.0] - unreleased
 
-Dependents: change the vectorium dependency to `0.12.0` (git tag `v0.12.0`). Existing k-means
-callers compile unchanged unless they implement `MeanDataset` themselves (see Breaking changes).
+Dependents: change the vectorium dependency to `0.12.0` (git tag `v0.12.0`). Existing k-means callers compile unchanged unless they implement `MeanDataset` themselves (see Breaking changes).
 
 ### Added
 
-- **`Clustering` trait** (`clustering::Clustering`): the interface every clustering algorithm
-  implements, in `KMeans`'s shape (`train`, `train_refined`, `train_with_index`,
-  `train_with_index_refined`, over any `MeanDataset`, centroids in a growable `G` whose encoder
-  fixes precision and metric). Code generic over `Cl: Clustering` swaps algorithms without other
-  changes. `ClusteringConfig` is its runtime-dispatch form (an enum, `Default` = k-means).
-- **`EMeans` / `EMeansBuilder`**: mini-batch EMA k-means, a port of faiss `contrib/e_means`
-  (MIT, Meta; Bessa et al., arXiv 2611.09501). A fixed epoch budget (`nepochs`, default 5); mini-batch
-  size and step size from the fitted scaling laws shipped in faiss (`EMeansRecipe`, `BatchLaw`);
-  cosine step-size schedule; revival of starved clusters; exact closing means. Dense and sparse, any
-  metric, weights, `refine` hooks (`sparse_centroid_pruning` works unchanged), spherical mode.
-  Deterministic for a seed across thread counts.
-- **Shared index-assignment policy** (`IndexRefresh`, `RefreshEvery`, `CentroidIndexBuilder`) for
-  `train_with_index` of both algorithms: refresh the centroid index every `n` updates (a Lloyd
-  iteration or an e-means mini-batch) or every `n` epochs, re-rank the top `candidates` results by
-  exact distance to the current centroids, and always refresh after splits/revivals move
-  centroids. Default: rebuild every update, top-1 (the 0.11
-  behaviour). `CentroidIndexBuilder::refresh` lets an index update itself instead of being rebuilt
-  (kANNolo's IVF over centroids only re-files them).
-- `KMeansBuilder::index_refresh` and `KMeansBuilder::keep_last` (return the last iteration's
-  centroids instead of the best-objective ones: under dot product with sparse pruning the
-  best objective can come from the first iteration, so the default silently discards later iterations).
-  `KMeans` and `KMeansBuilder` are `Clone + Debug`.
+- **`Solver` for `KMeans`**: k-means is now one configuration with a pluggable solver, `KMeansBuilder::solver(Solver::Lloyd(LloydParams { .. }) | Solver::EMeans(EMeansParams { .. }))`. `KMeans` keeps everything the solvers share (initialisation, flat and index assignment, weights, `refine`, spherical mode, seeding, conversion to `G`, the index refresh policy, verbose output). The default is `Solver::Lloyd(LloydParams::default())`, i.e. the 0.11 behaviour with 10 iterations. `KMeansBuilder::n_iter` / `n_redo` remain as shorthands for the Lloyd parameters. `KMeans` and `KMeansBuilder` are `Clone + Debug`; `KMeans::solver()` returns the configured solver.
+- **E-means solver** (`Solver::EMeans`, `EMeansParams`): mini-batch EMA k-means, a port of faiss `contrib/e_means` (MIT, Meta; Bessa et al., arXiv 2611.09501). A fixed epoch budget (`nepochs`, default 5); mini-batch size and step size from the fitted scaling laws shipped in faiss (`EMeansRecipe`, `BatchLaw`, `EMeansParams::recipe`); cosine step-size schedule; revival of starved clusters; exact closing means. Dense and sparse, any metric, weights, `refine` hooks (`sparse_centroid_pruning` works unchanged), spherical mode. Deterministic for a seed across thread counts.
+- **Shared index-assignment policy** (`IndexRefresh`, `RefreshEvery`, `CentroidIndexBuilder`) for `train_with_index` with either solver: refresh the centroid index every `n` updates (a Lloyd iteration or an e-means mini-batch) or every `n` epochs, and always refresh after splits/revivals move centroids. Each vector takes the index's top result, with its distance recomputed exactly against the current centroid. Default: rebuild every update (the 0.11 behaviour). `CentroidIndexBuilder::refresh` lets an index update itself instead of being rebuilt (kANNolo's IVF over centroids only re-files them). Set with `KMeansBuilder::index_refresh`.
 - `MeanDataset::lerp(centroid, target, weight)`: the EMA update, dense and sparse (support union).
-- `ProductQuantizer::train_with_clustering`, `MultiVecProductQuantizer::train_with_clustering`,
-  `MultiVecTwoLevelProductQuantizer::train_with_clustering` (coarse and fine algorithms) and
-  `::train_from_coarse_with_clustering`. The existing `train*` functions call them with k-means.
-- `kmeans_bench --clustering emeans --epochs T` (and `--n-iter`, `--seed`); it now also reports the
-  mean squared distance to the nearest centroid.
+- `ProductQuantizer::train_with_kmeans`, `MultiVecProductQuantizer::train_with_kmeans`, `MultiVecTwoLevelProductQuantizer::train_with_kmeans` (coarse and fine configurations) and `::train_from_coarse_with_kmeans` take a `KMeans`, so product quantizers can use either solver. The existing `train*` functions call them with the default Lloyd configuration.
+- `kmeans_bench --solver lloyd|emeans` with `--lloyd-n-iter`, `--emeans-epochs` and `--seed`; it now also reports the mean squared distance to the nearest centroid.
+
+### Fixes
+
+- **Lloyd returns the centroids its objective was measured on.** 0.11 compared the objective of iteration *i* (measured against the centroids *before* its update) but stored the centroids *after* the update as the best, so with a non-monotone objective (dot product, sparse pruning, splits) it could return centroids paired with another iteration's objective; in a sparse dot-product run, the winning objective was the one measured against the raw initial centroids. Now each restart returns its final centroids, and with `n_redo > 1` restarts are compared on the exact objective of the centroids they return (one extra assignment pass per restart; none with the default single restart).
+- Spherical Lloyd normalises its initial centroids before the first assignment (as faiss does), so a long training vector drawn as an initial centroid no longer attracts every vector under the dot product.
 
 ### Breaking changes (relative to 0.11.1)
 
 None of these affect kANNolo, Seismic or tachiom.
 
-- **`MeanDataset` has a new required method, `lerp`**, which e-means uses to move centroids. Only
-  custom `MeanDataset` implementations need to add it.
-- **`KMeans::train_with_index` takes a `CentroidIndexBuilder` instead of a closure.** Closures
-  implement it, so existing calls compile unchanged.
-- **`KMeans::train_with_index` now picks the best iteration using exact distances instead of the
-  index's.** Assignments are unchanged. Results differ only if the index's distances aren't
-  exact, such as a quantised index.
+- **`MeanDataset` has a new required method, `lerp`**, which e-means uses to move centroids. Only custom `MeanDataset` implementations need to add it.
+- **`KMeans::train_with_index` takes a `CentroidIndexBuilder` instead of a closure.** Closures implement it, so existing calls compile unchanged.
+- **Lloyd's result selection** (see Fixes): with a single restart, Lloyd now always returns its last iteration's centroids. For squared Euclidean distance with exact means and no splits the objective is non-increasing, so the result is the same as before up to floating-point noise once converged; otherwise it can differ.
 
 ### Performance-relevant changes
 
 | Change |
 |---|
-| E-means against Lloyd's k-means: see the PR for the benchmark tables. |
-| `KMeans::train` (flat) runs the same arithmetic in the same order as 0.11.1, so results are unchanged. |
+| E-means against Lloyd's k-means and against faiss: see the PR for the benchmark tables. |
+| `KMeans::train` with the default Lloyd solver runs the same arithmetic in the same order as 0.11.1; results are unchanged except where the selection fix above applies. |
 
 ## [0.11.1] - 2026-10-21
 
