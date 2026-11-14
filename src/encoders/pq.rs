@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::PlainDenseDataset;
 use crate::PlainDenseQuantizer;
 use crate::SpaceUsage;
-use crate::clustering::KMeansBuilder;
+use crate::clustering::{KMeans, KMeansBuilder};
 use crate::core::vector::{DenseVectorOwned, DenseVectorView};
 use crate::core::vector_encoder::{DenseVectorEncoder, QueryEvaluator, VectorEncoder};
 use crate::distances::{Distance, DotProduct, SquaredEuclideanDistance};
@@ -95,11 +95,25 @@ where
         n_iter: usize,
         seed: Option<u64>,
     ) -> Self {
+        let kmeans = KMeansBuilder::new()
+            .epochs(n_iter as f64)
+            .seed(seed)
+            .build();
+        Self::train_with_kmeans(training_data, &kmeans)
+    }
+
+    /// Train a ProductQuantizer with the given [`KMeans`] configuration (any
+    /// [`Solver`](crate::clustering::Solver)) for the per-subspace codebooks. The same
+    /// configuration (and so the same seed) is used for every subspace, in parallel.
+    pub fn train_with_kmeans<Ds: crate::ScalarDenseSupportedDistance>(
+        training_data: &PlainDenseDataset<f32, Ds>,
+        kmeans: &KMeans,
+    ) -> Self {
         let d = training_data.output_dim();
         assert_eq!(M % 4, 0, "M ({}) is not divisible by 4", M);
         assert_eq!(d % M, 0, "d ({}) is not divisible by M ({})", d, M);
         let dsub = d / M;
-        let centroids = Self::train_centroids(training_data, dsub, n_iter, seed).into_boxed_slice();
+        let centroids = Self::train_centroids(training_data, dsub, kmeans).into_boxed_slice();
         Self {
             d,
             dsub,
@@ -114,8 +128,7 @@ where
     fn train_centroids<Ds: crate::ScalarDenseSupportedDistance>(
         training_data: &PlainDenseDataset<f32, Ds>,
         dsub: usize,
-        n_iter: usize,
-        seed: Option<u64>,
+        kmeans: &KMeans,
     ) -> Vec<f32> {
         use rayon::prelude::*;
 
@@ -140,7 +153,6 @@ where
                     sub_dataset.push(sub_vector);
                 }
 
-                let kmeans = KMeansBuilder::new().n_iter(n_iter).seed(seed).build();
                 let trained: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> =
                     kmeans.train(&sub_dataset, KSUB, None, PlainDenseQuantizer::new(dsub));
                 // KMeans returns AoS: [c0_d0, c0_d1, .., c0_{dsub-1}, c1_d0, ..]

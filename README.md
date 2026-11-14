@@ -19,7 +19,8 @@ dynamic dispatch on the hot path. It is the data layer of [kANNolo](https://gith
   faster than the authors' implementation.
 - **Portable fast kernels:** plain Rust that the compiler vectorizes for AVX2, AVX-512 or NEON.
 
-It also ships an exact `FlatIndex`, k-means, and a CPU ground-truth tool.
+It also ships an exact `FlatIndex`, two clustering algorithms behind one interface (Lloyd's k-means and
+mini-batch [e-means](#10-clustering-k-means-and-e-means)), and a CPU ground-truth tool.
 
 Vectorium and kANNolo are described in our paper [*Modular and Efficient Approximate Nearest Neighbors Search with Vectorium and kANNolo*](https://arxiv.org/abs/2611.03927) ([citation](#citation)). To reproduce the results of our papers, see [papers_reproducibility](https://github.com/tusKANNy/papers_reproducibility).
 
@@ -526,6 +527,63 @@ no `query_bits` dial. The intermediate widths
 which costs throughput without buying a useful accuracy/footprint point.
 
 
+### 10) Clustering: k-means with Lloyd or e-means
+
+`KMeans` clusters any dense or sparse dataset, writes centroids into a growable dataset whose encoder
+fixes their precision and the clustering metric, and accepts per-vector weights and a `refine` hook
+(e.g. `sparse_centroid_pruning`). How the centroids are fitted is its `Solver`:
+- `Solver::Lloyd` (the default): Lloyd's algorithm.
+- `Solver::EMeans` (`EMeansParams`): e-means, mini-batch k-means with an exponential moving
+  average, ported from [faiss `contrib/e_means`](https://github.com/facebookresearch/faiss/tree/main/contrib/e_means).
+
+Training runs for a budget of epochs, set with `KMeansBuilder::epochs` for either solver; an epoch
+assigns every training vector once, and costs about the same for both solvers. Lloyd's updates the
+centroids once per epoch, e-means once per mini-batch. Unset, the budget is the solver's default:
+10 epochs for Lloyd and 2 for e-means (faiss's e-means defaults to 5; 2 already matches or beats
+Lloyd at 10 in our benchmarks). E-means accepts fractional budgets and picks the mini-batch size and
+step size from fitted scaling laws, so it needs no tuning; see Bessa et al., [*e-means:
+outperforming k-means (in one-tenth the epochs)*](https://arxiv.org/abs/2611.09501)
+([citation](#citation)). `KMeansBuilder::n_redo` restarts either solver from new initial centroids
+and keeps the best.
+
+```rust
+use vectorium::{
+    Dataset, EMeansParams, FlatIndex, IndexRefresh, KMeansBuilder, PlainDenseDataset,
+    PlainDenseDatasetGrowable, PlainDenseQuantizer, Solver, SquaredEuclideanDistance,
+};
+
+type Data = PlainDenseDataset<f32, SquaredEuclideanDistance>;
+type Centroids = PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance>;
+
+let (n, d, k) = (2_000, 8, 16);
+let values: Vec<f32> = (0..n * d).map(|i| ((i * 7919) % 1000) as f32 / 100.0).collect();
+let data = Data::from_raw(values.into_boxed_slice(), n, PlainDenseQuantizer::new(d));
+
+// Flat (exhaustive) assignment; the centroid encoder fixes precision and metric.
+let lloyd = KMeansBuilder::new().epochs(10.0).seed(Some(42)).build();
+let centroids: Centroids = lloyd.train(&data, k, None, PlainDenseQuantizer::new(d));
+assert_eq!(centroids.len(), k);
+
+let emeans = KMeansBuilder::new()
+    .solver(Solver::EMeans(EMeansParams::default()))
+    .epochs(2.0)
+    .seed(Some(42))
+    .build();
+let _: Centroids = emeans.train(&data, k, None, PlainDenseQuantizer::new(d));
+
+// Assignment through an index over the centroids (an HNSW or IVF when k is large). By default the
+// index is rebuilt for every update; `IndexRefresh` sets a longer cadence, trading accuracy for fewer refreshes.
+let emeans = KMeansBuilder::new()
+    .solver(Solver::EMeans(EMeansParams::default()))
+    .seed(Some(42))
+    .index_refresh(IndexRefresh::every_updates(4))
+    .build();
+let _: Centroids = emeans.train_with_index(&data, k, None, PlainDenseQuantizer::new(d), FlatIndex::from, &());
+```
+
+Product quantizers take a `KMeans` too, with either solver: `ProductQuantizer::train_with_kmeans(&data, &emeans)`.
+
+
 ## Design notes
 
 - **Type safety by construction:** datasets are sealed and are tied to a specific encoder type, so mixing dense/sparse/packed
@@ -553,6 +611,23 @@ If you use Vectorium in your work, please cite our paper (submitted to *Informat
 }
 ```
 
+If you use the e-means solver, please also cite the e-means paper:
+
+```bibtex
+@misc{bessa2026emeans,
+  title  = {{e-means}: outperforming {k-means} (in one-tenth the epochs)},
+  author = {Bessa, Swann and Mazar{\'e}, Pierre-Emmanuel and Szilvasy, Gergely and
+            Touvron, Hugo and Picard, David and Douze, Matthijs and J{\'e}gou, Herv{\'e}},
+  year   = {2026},
+  note   = {Preprint},
+  url    = {https://arxiv.org/abs/2611.09501}
+}
+```
+
 ## License
 
 MIT. See `LICENSE-MIT`.
+
+`src/clustering/emeans.rs` is a port of the e-means implementation in
+[faiss `contrib/e_means`](https://github.com/facebookresearch/faiss/tree/main/contrib/e_means),
+Copyright (c) Meta Platforms, Inc. and affiliates, also MIT-licensed.

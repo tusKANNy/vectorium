@@ -194,6 +194,13 @@ where
         v
     }
 
+    #[inline]
+    fn lerp(&self, centroid: &mut Self::Vector, target: &Self::Vector, weight: f32) {
+        for (c, &t) in centroid.as_mut().iter_mut().zip(target.values()) {
+            *c += weight * (t - *c);
+        }
+    }
+
     fn mean(&self, ids: &[u32], weights: Option<&[f32]>) -> Self::Vector {
         let mut sum = vec![0.0f32; self.input_dim()];
         let mut decoded = vec![0.0f32; self.input_dim()];
@@ -653,6 +660,15 @@ mod tests {
         let c = crate::DenseVectorOwned::new(vec![1.0_f32, 2.5]);
         let r = permutable_dense().residual(1, &c);
         assert_eq!(r.values(), &[19.0, 18.5]);
+    }
+
+    #[test]
+    fn dense_lerp_moves_towards_target() {
+        use crate::core::dataset::MeanDataset;
+        let mut c = crate::DenseVectorOwned::new(vec![0.0_f32, 4.0]);
+        let t = crate::DenseVectorOwned::new(vec![2.0_f32, 0.0]);
+        permutable_dense().lerp(&mut c, &t, 0.25);
+        assert_eq!(c.values(), &[0.5, 3.0]);
     }
 
     #[test]

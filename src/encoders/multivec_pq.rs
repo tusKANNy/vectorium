@@ -17,7 +17,7 @@ use std::marker::PhantomData;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::clustering::KMeansBuilder;
+use crate::clustering::{KMeans, KMeansBuilder};
 use crate::core::vector::{DenseMultiVectorOwned, DenseMultiVectorView, DenseVectorView};
 use crate::core::vector_encoder::{MultiVecEncoder, QueryEvaluator, VectorEncoder};
 use crate::distances::{Distance, DotProduct, SquaredEuclideanDistance};
@@ -122,6 +122,15 @@ impl<const M: usize, In> MultiVecProductQuantizer<M, In> {
     ///
     /// Panics if `M % 4 != 0` or `token_dim % M != 0`.
     pub fn train(token_vectors: &PlainDenseDataset<f32, SquaredEuclideanDistance>) -> Self {
+        Self::train_with_kmeans(token_vectors, &KMeansBuilder::new().build())
+    }
+
+    /// Like [`train`](Self::train), but with the given [`KMeans`] configuration (any
+    /// [`Solver`](crate::clustering::Solver)) for the per-subspace codebooks.
+    pub fn train_with_kmeans(
+        token_vectors: &PlainDenseDataset<f32, SquaredEuclideanDistance>,
+        kmeans: &KMeans,
+    ) -> Self {
         let token_dim = token_vectors.output_dim();
         assert_eq!(M % 4, 0, "M ({}) must be divisible by 4", M);
         assert_eq!(
@@ -155,7 +164,6 @@ impl<const M: usize, In> MultiVecProductQuantizer<M, In> {
                     let sub = DenseVectorView::new(&vector.values()[m * dsub..(m + 1) * dsub]);
                     sub_dataset.push(sub);
                 }
-                let kmeans = KMeansBuilder::new().build();
                 kmeans
                     .train::<_, PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance>>(
                         &sub_dataset,

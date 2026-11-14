@@ -1,17 +1,17 @@
 use std::time::Instant;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use num_traits::FromPrimitive;
 use std::path::{Path, PathBuf};
 use vectorium::PlainDenseDatasetGrowable;
-use vectorium::clustering::KMeansBuilder;
+use vectorium::clustering::{EMeansParams, KMeans, KMeansBuilder, Solver};
 use vectorium::core::vector::DenseVectorView;
 use vectorium::datasets::readers::{read_npy_f32, read_seismic_format};
 use vectorium::distances::{DotProduct, SquaredEuclideanDistance};
 use vectorium::{ComponentType, Dataset, DatasetGrowable, PlainDenseDataset, PlainDenseQuantizer};
 
 #[derive(Parser)]
-#[command(about = "Benchmark KMeans training over dense or sparse datasets")]
+#[command(about = "Benchmark k-means / e-means training over dense or sparse datasets")]
 struct Args {
     /// Path to the dataset file (.npy for dense, Seismic binary for sparse)
     #[arg(long)]
@@ -28,6 +28,25 @@ struct Args {
     /// Number of clusters to request
     #[arg(long)]
     n_clusters: usize,
+
+    /// K-means solver
+    #[arg(long, value_enum, default_value_t = SolverArg::Lloyd)]
+    solver: SolverArg,
+
+    /// Epoch budget (default: the solver's, 10 for Lloyd and 2 for e-means). Lloyd needs a
+    /// whole number; e-means accepts fractions.
+    #[arg(long)]
+    epochs: Option<f64>,
+
+    /// RNG seed (default: from entropy)
+    #[arg(long)]
+    seed: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SolverArg {
+    Lloyd,
+    Emeans,
 }
 
 fn main() {
@@ -43,17 +62,29 @@ fn main() {
         other => panic!("Unsupported dataset type '{}'", other),
     };
 
-    let builder = KMeansBuilder::new().verbose(true).build();
+    let solver = match args.solver {
+        SolverArg::Lloyd => Solver::Lloyd,
+        SolverArg::Emeans => Solver::EMeans(EMeansParams::default()),
+    };
+    let mut builder = KMeansBuilder::new()
+        .solver(solver)
+        .seed(args.seed)
+        .verbose(true);
+    if let Some(epochs) = args.epochs {
+        builder = builder.epochs(epochs);
+    }
+    let kmeans = builder.build();
 
     println!(
-        "Running KMeans on {} vectors, {}D, {} clusters)",
+        "Running k-means ({:?}) on {} vectors, {}D, {} clusters",
+        args.solver,
         dataset.len(),
         dataset.output_dim(),
         args.n_clusters,
     );
 
     let t0 = Instant::now();
-    let centroids: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> = builder.train(
+    let centroids: PlainDenseDatasetGrowable<f32, SquaredEuclideanDistance> = kmeans.train(
         &dataset,
         args.n_clusters,
         None,
@@ -63,6 +94,14 @@ fn main() {
 
     println!("Training finished in {:.3?}", elapsed);
     println!("Resulting centroids: {}", centroids.len());
+
+    // Mean squared distance of every vector to its nearest centroid (the k-means objective).
+    let mse = KMeans::compute_assignments(&dataset, &centroids)
+        .iter()
+        .map(|&(d, _)| d as f64)
+        .sum::<f64>()
+        / dataset.len() as f64;
+    println!("Mean squared distance to nearest centroid: {mse:.6e}");
 }
 
 fn load_dense(path: &Path) -> PlainDenseDataset<f32, SquaredEuclideanDistance> {
