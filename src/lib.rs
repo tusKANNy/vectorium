@@ -55,7 +55,8 @@ pub use core::vector_encoder::{
 
 pub use clustering::{
     BatchLaw, CentroidIndexBuilder, EMeansParams, EMeansRecipe, IndexRefresh, KMeans,
-    KMeansBuilder, RefreshEvery, Solver, sparse_centroid_pruning,
+    KMeansBuilder, RefreshEvery, SimpleSparseInvertedIndex, SimpleSparseInvertedIndexSearchParams,
+    Solver, sparse_centroid_pruning,
 };
 
 pub use core::data_block::{BLOCK_SIZE, Block, DataBlock, DataBlockU8, DataBlockU16};
