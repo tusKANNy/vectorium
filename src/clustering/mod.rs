@@ -11,13 +11,16 @@
 //!
 //! The entry points are [`KMeans::train`] / [`KMeans::train_refined`] (exact, flat assignment)
 //! and [`KMeans::train_with_index`] / [`KMeans::train_with_index_refined`] (assignment
-//! through an index over the current centroids, e.g. an HNSW or IVF when `k` is large).
+//! through an index over the current centroids, e.g. an HNSW or IVF when `k` is large, or a
+//! [`SparseCentroidIndex`] for sparse centroids under the dot product).
 
 pub mod emeans;
 pub mod index_assign;
 pub mod kmeans;
 pub mod lloyd;
+pub mod sparse_centroid_index;
 
 pub use emeans::{BatchLaw, EMeansParams, EMeansRecipe};
 pub use index_assign::{CentroidIndexBuilder, IndexRefresh, RefreshEvery};
 pub use kmeans::{KMeans, KMeansBuilder, Solver, sparse_centroid_pruning};
+pub use sparse_centroid_index::{SparseCentroidIndex, SparseCentroidIndexSearchParams};
