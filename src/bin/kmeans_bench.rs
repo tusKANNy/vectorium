@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
@@ -5,8 +6,8 @@ use num_traits::FromPrimitive;
 use std::path::{Path, PathBuf};
 use vectorium::PlainDenseDatasetGrowable;
 use vectorium::clustering::{
-    EMeansParams, KMeans, KMeansBuilder, SimpleSparseInvertedIndex,
-    SimpleSparseInvertedIndexSearchParams, Solver, sparse_centroid_pruning,
+    EMeansParams, KMeans, KMeansBuilder, SparseCentroidIndex,
+    SparseCentroidIndexSearchParams, Solver, sparse_centroid_pruning,
 };
 use vectorium::core::vector::DenseVectorView;
 use vectorium::datasets::readers::{read_npy_f32, read_seismic_format};
@@ -36,15 +37,15 @@ struct Args {
     centroid_pruning: f32,
 
     /// 'sparse-dot' only: how training assigns vectors to centroids. 'flat' scans every
-    /// centroid; 'simple-sparse' walks a `SimpleSparseInvertedIndex` (inverted index) over them,
+    /// centroid; 'sparse-centroid' walks a `SparseCentroidIndex` (inverted index) over them,
     /// rebuilt after every update.
     #[arg(long, value_enum, default_value_t = CentroidIndexArg::Flat)]
     centroid_index: CentroidIndexArg,
 
-    /// 'simple-sparse' only: score only each vector's `doc_cut` largest components
+    /// 'sparse-centroid' only: score only each vector's `doc_cut` largest components
     /// (approximate). Unset: all components (exact).
     #[arg(long)]
-    doc_cut: Option<usize>,
+    doc_cut: Option<NonZeroUsize>,
 
     /// Component type for sparse datasets: 'u16' or 'u32' (default: u32)
     #[arg(long, default_value = "u32")]
@@ -71,7 +72,7 @@ struct Args {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum CentroidIndexArg {
     Flat,
-    SimpleSparse,
+    SparseCentroid,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -217,8 +218,8 @@ where
         CentroidIndexArg::Flat => {
             kmeans.train_refined(&dataset, args.n_clusters, None, encoder, refine)
         }
-        CentroidIndexArg::SimpleSparse => {
-            let params = SimpleSparseInvertedIndexSearchParams {
+        CentroidIndexArg::SparseCentroid => {
+            let params = SparseCentroidIndexSearchParams {
                 doc_cut: args.doc_cut,
             };
             kmeans.train_with_index_refined(
@@ -226,7 +227,7 @@ where
                 args.n_clusters,
                 None,
                 encoder,
-                |c: Centroids<C>| SimpleSparseInvertedIndex::from(c),
+                |c: Centroids<C>| SparseCentroidIndex::from(c),
                 &params,
                 refine,
             )
@@ -238,11 +239,11 @@ where
     // Final, exact assignment for the metrics, through an exact index (same result as a flat
     // scan, up to floating-point summation order, and much faster at large k).
     let t1 = Instant::now();
-    let final_index = SimpleSparseInvertedIndex::from(&centroids);
+    let final_index = SparseCentroidIndex::from(&centroids);
     let assignments = KMeans::assign_with_index(
         &dataset,
         &final_index,
-        &SimpleSparseInvertedIndexSearchParams::exact(),
+        &SparseCentroidIndexSearchParams::exact(),
     );
     let assign_time = t1.elapsed();
     println!("Final exact assignment in {assign_time:.3?}");
