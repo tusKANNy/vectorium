@@ -18,6 +18,7 @@ Dependents: change the vectorium dependency to `0.12.0` (git tag `v0.12.0`), rep
 - `MeanDataset::lerp(centroid, target, weight)`: the EMA update, dense and sparse (support union).
 - `ProductQuantizer::train_with_kmeans`, `MultiVecProductQuantizer::train_with_kmeans`, `MultiVecTwoLevelProductQuantizer::train_with_kmeans` (coarse and fine configurations) and `::train_from_coarse_with_kmeans` take a `KMeans`, so product quantizers can use either solver. The existing `train*` functions call them with the default Lloyd configuration.
 - `kmeans_bench --solver lloyd|emeans` with `--epochs` and `--seed`; it now also reports the mean squared distance to the nearest centroid.
+- `ProductQuantizer::default_kmeans` (the configuration `train` and `convert_from` use: vectorium's default solver, 25 Lloyd iterations or 5 e-means epochs) and `ProductQuantizer::kmeans_for_solver(solver)`; `DenseDataset<ProductQuantizer>::from_plain_with_kmeans` / `from_plain_f16_with_kmeans` encode a dataset like `convert_from` with any `KMeans`. The PQ constants `LLOYD_N_ITER` (25) and `EMEANS_EPOCHS` (5) are public. PQ training is unchanged with the default (Lloyd) solver.
 
 ### Fixes
 

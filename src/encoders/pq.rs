@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::PlainDenseDataset;
 use crate::PlainDenseQuantizer;
 use crate::SpaceUsage;
-use crate::clustering::{KMeans, KMeansBuilder};
+use crate::clustering::{KMeans, KMeansBuilder, Solver};
 use crate::core::vector::{DenseVectorOwned, DenseVectorView};
 use crate::core::vector_encoder::{DenseVectorEncoder, QueryEvaluator, VectorEncoder};
 use crate::distances::{Distance, DotProduct, SquaredEuclideanDistance};
@@ -52,7 +52,11 @@ const KSUB: usize = 256;
 /// per step regardless of `TILE`, so a narrow tile amortizes it over too little
 /// arithmetic, while a wide one raises register pressure.
 const TILE: usize = 32;
-const DEFAULT_KMEANS_N_ITER: usize = 25;
+/// Lloyd iterations of the PQ codebook training (see [`ProductQuantizer::default_kmeans`]).
+pub const LLOYD_N_ITER: usize = 25;
+/// E-means epochs of the PQ codebook training: e-means matches Lloyd at about a fifth of its
+/// epochs, so this is [`LLOYD_N_ITER`] / 5.
+pub const EMEANS_EPOCHS: f64 = LLOYD_N_ITER as f64 / 5.0;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(bound(serialize = "", deserialize = ""))]
@@ -79,16 +83,33 @@ impl<const M: usize, D> ProductQuantizer<M, D>
 where
     D: ProductQuantizerDistance,
 {
+    /// The k-means configuration [`train`](Self::train) (and so `convert_from`) uses for the
+    /// per-subspace codebooks: vectorium's default [`Solver`] (`Solver::default()`), with the
+    /// budget of [`kmeans_for_solver`](Self::kmeans_for_solver).
+    pub fn default_kmeans() -> KMeans {
+        Self::kmeans_for_solver(Solver::default())
+    }
+
+    /// The PQ codebook k-means configuration for `solver`: [`LLOYD_N_ITER`] iterations for
+    /// Lloyd, [`EMEANS_EPOCHS`] epochs for e-means.
+    pub fn kmeans_for_solver(solver: Solver) -> KMeans {
+        let epochs = match solver {
+            Solver::Lloyd => LLOYD_N_ITER as f64,
+            Solver::EMeans(_) => EMEANS_EPOCHS,
+        };
+        KMeansBuilder::new().solver(solver).epochs(epochs).build()
+    }
+
+    /// Train a ProductQuantizer with [`default_kmeans`](Self::default_kmeans).
     #[inline]
     pub fn train<Ds: crate::ScalarDenseSupportedDistance>(
         training_data: &PlainDenseDataset<f32, Ds>,
     ) -> Self {
-        Self::train_with_kmeans_options(training_data, DEFAULT_KMEANS_N_ITER, None)
+        Self::train_with_kmeans(training_data, &Self::default_kmeans())
     }
 
-    /// Train a ProductQuantizer while controlling the inner k-means seed and iteration count.
-    /// This keeps the outer PQ training API unchanged for existing callers while allowing
-    /// reproducible bin-specific runs to match older pipelines more closely.
+    /// Train a ProductQuantizer with Lloyd's k-means, controlling the seed and iteration count.
+    /// To pick the solver, use [`train_with_kmeans`](Self::train_with_kmeans).
     #[inline]
     pub fn train_with_kmeans_options<Ds: crate::ScalarDenseSupportedDistance>(
         training_data: &PlainDenseDataset<f32, Ds>,
@@ -616,6 +637,21 @@ where
     type Config = ();
 
     fn convert_from(dataset: &PlainDenseDataset<f32, Ds>, _config: ()) -> Self {
+        Self::from_plain_with_kmeans(dataset, &ProductQuantizer::<M, D>::default_kmeans())
+    }
+}
+
+impl<const M: usize, D> crate::DenseDataset<ProductQuantizer<M, D>>
+where
+    D: ProductQuantizerDistance + 'static,
+{
+    /// `convert_from` with an explicit k-means configuration (any
+    /// [`Solver`](crate::clustering::Solver)) for the codebooks: samples the training set on
+    /// large inputs exactly like `convert_from`, trains, and encodes every vector.
+    pub fn from_plain_with_kmeans<Ds: crate::ScalarDenseSupportedDistance>(
+        dataset: &PlainDenseDataset<f32, Ds>,
+        kmeans: &KMeans,
+    ) -> Self {
         let sample_size = ProductQuantizer::<M, D>::compute_training_sample_size(dataset.len());
 
         let pq_encoder = match sample_size {
@@ -626,10 +662,10 @@ where
                     dataset.len()
                 );
                 let sample = ProductQuantizer::<M, D>::sample_random_dataset(dataset, size);
-                ProductQuantizer::<M, D>::train(&sample)
+                ProductQuantizer::<M, D>::train_with_kmeans(&sample, kmeans)
             }
             // Small enough to train on directly — no copy of any kind.
-            None => ProductQuantizer::<M, D>::train(dataset),
+            None => ProductQuantizer::<M, D>::train_with_kmeans(dataset, kmeans),
         };
 
         crate::DenseDataset::<ProductQuantizer<M, D>>::from_flat_par(
@@ -654,6 +690,19 @@ where
     type Config = ();
 
     fn convert_from(dataset: &PlainDenseDataset<half::f16, Ds>, _config: ()) -> Self {
+        Self::from_plain_f16_with_kmeans(dataset, &ProductQuantizer::<M, D>::default_kmeans())
+    }
+}
+
+impl<const M: usize, D> crate::DenseDataset<ProductQuantizer<M, D>>
+where
+    D: ProductQuantizerDistance + 'static,
+{
+    /// [`from_plain_with_kmeans`](Self::from_plain_with_kmeans) for an `f16` source.
+    pub fn from_plain_f16_with_kmeans<Ds: crate::ScalarDenseSupportedDistance>(
+        dataset: &PlainDenseDataset<half::f16, Ds>,
+        kmeans: &KMeans,
+    ) -> Self {
         let sample_size = ProductQuantizer::<M, D>::compute_training_sample_size(dataset.len());
 
         let training_data: PlainDenseDataset<f32, Ds> = match sample_size {
@@ -669,7 +718,7 @@ where
             // `PQ_TRAIN_SAMPLING_MIN_SIZE` vectors.
             None => ProductQuantizer::<M, D>::sample_random_dataset_upcast(dataset, dataset.len()),
         };
-        let pq_encoder = ProductQuantizer::<M, D>::train(&training_data);
+        let pq_encoder = ProductQuantizer::<M, D>::train_with_kmeans(&training_data, kmeans);
 
         crate::DenseDataset::<ProductQuantizer<M, D>>::from_flat_par_upcast(
             pq_encoder,
@@ -826,13 +875,13 @@ mod tests {
         let from_l2 =
             ProductQuantizer::<M_TEST, SquaredEuclideanDistance>::train_with_kmeans_options(
                 &l2,
-                DEFAULT_KMEANS_N_ITER,
+                LLOYD_N_ITER,
                 Some(42),
             );
         let from_ip =
             ProductQuantizer::<M_TEST, SquaredEuclideanDistance>::train_with_kmeans_options(
                 &ip,
-                DEFAULT_KMEANS_N_ITER,
+                LLOYD_N_ITER,
                 Some(42),
             );
 
